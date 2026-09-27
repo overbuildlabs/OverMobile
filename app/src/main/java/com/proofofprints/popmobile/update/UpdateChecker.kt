@@ -163,6 +163,6 @@ class UpdateChecker(context: Context) {
 
         // Swap to a configurable host if the repo ever moves.
         private const val RELEASES_API_URL =
-            "https://api.github.com/repos/proofofprints/OverMobile/releases/latest"
+            "https://api.github.com/repos/overbuildlabs/OverMobile/releases/latest"
     }
 }
