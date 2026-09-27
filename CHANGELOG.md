@@ -3,6 +3,15 @@
 All notable changes to OverMobile are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Changed
+- **New OverMobile app icon.** OverMobile has its own mark instead of the
+  company logo: the OverBuild Labs faceted hexagon holding a purple phone
+  with the company cube inside. Same family as the OverManager icon.
+  Launcher (adaptive, legacy and round) and the Play Store image are
+  regenerated from `docs/brand/overmobile-mark.svg`. The splash screen and
+  header still show the company logo.
+
 ## [1.2.0] — 2026-05-29
 ### Changed
 - **Rebrand to OverBuild Labs.** The app is now **OverMobile** by **OverBuild Labs** — matches the website, OverManager desktop app, and OverMiner hardware line. Application identity (`applicationId`), on-disk preferences, and signing keypair are unchanged: existing PoPMobile installs upgrade to OverMobile in place with no loss of wallet, pool, pairing, or settings state.
