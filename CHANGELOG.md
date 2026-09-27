@@ -11,6 +11,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   Launcher (adaptive, legacy and round) and the Play Store image are
   regenerated from `docs/brand/overmobile-mark.svg`. The splash screen and
   header still show the company logo.
+- **Pool moves to `pool.overbuildlabs.com`.** New installs pre-fill
+  `stratum+tcp://pool.overbuildlabs.com:5558`. Existing installs that saved
+  `pool.proofofprints.com` are switched to `pool.overbuildlabs.com` (same
+  port) on first launch after updating, before mining starts. Any other pool
+  you saved is left alone.
+- **In-app updates now check `overbuildlabs/OverMobile`** on GitHub instead
+  of relying on the redirect from the old `proofofprints` repo path.
+- **Warning colors are amber again.** The rebrand had turned every warning
+  (temperature, battery, thermal state, pool connecting/error, pairing
+  required, log warnings) violet. Warnings are amber, readouts (shares,
+  hashes, difficulty) are Kaspa teal, and a connected pool is emerald.
+  Violet is kept for the brand mark only.
 
 ## [1.2.0] — 2026-05-29
 ### Changed

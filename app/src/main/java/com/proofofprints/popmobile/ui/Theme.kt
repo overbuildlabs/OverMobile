@@ -1,6 +1,7 @@
 /**
  * OverMobile Material3 theme — OverBuild Labs palette (emerald primary,
- * violet accent, near-black surfaces).
+ * Kaspa-teal secondary for data, near-black surfaces). Violet is kept for
+ * brand marks only, never UI.
  *
  * Copyright (c) 2026 OverBuild Labs
  */
@@ -13,8 +14,8 @@ import androidx.compose.ui.graphics.Color
 private val KASMinerColorScheme = darkColorScheme(
     primary = Color(0xFF10B981),       // emerald-500
     onPrimary = Color.Black,
-    secondary = Color(0xFF8B5CF6),     // violet-500
-    onSecondary = Color.White,
+    secondary = Color(0xFF70C7BA),     // Kaspa teal (data)
+    onSecondary = Color.Black,
     background = Color(0xFF0C0C0F),    // page background
     onBackground = Color.White,
     surface = Color(0xFF16161B),       // section background

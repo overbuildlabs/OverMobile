@@ -96,6 +96,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Move a saved pool off the retired pool.proofofprints.com host
+        // before the dashboard reads it.
+        com.proofofprints.popmobile.service.PoolMigration.migrateSaved(
+            getSharedPreferences("kas_miner", Context.MODE_PRIVATE)
+        )
+
         // Request notification permission (Android 13+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
@@ -451,13 +457,13 @@ class MainActivity : ComponentActivity() {
                         StatCardCompact(
                             label = "SHARES",
                             value = if (sharesRejected > 0) "$sharesFound/${sharesRejected}r" else sharesFound.toString(),
-                            color = Color(0xFF8B5CF6),
+                            color = Color(0xFF70C7BA),
                             modifier = Modifier.weight(1f)
                         )
                         StatCardCompact(
                             label = "HASHES",
                             value = formatHashes(totalHashes),
-                            color = Color(0xFF8B5CF6),
+                            color = Color(0xFF70C7BA),
                             modifier = Modifier.weight(1f)
                         )
                         StatCardCompact(
@@ -478,7 +484,7 @@ class MainActivity : ComponentActivity() {
                             color = when {
                                 cpuTemp >= 55 -> Color(0xFFFF4444)
                                 cpuTemp >= 50 -> Color(0xFFFF8C00)
-                                cpuTemp >= 45 -> Color(0xFF8B5CF6)
+                                cpuTemp >= 45 -> Color(0xFFFBBF24)
                                 else -> Color(0xFF10B981)
                             },
                             modifier = Modifier.weight(1f)
@@ -488,7 +494,7 @@ class MainActivity : ComponentActivity() {
                             value = "$batteryPercent%",
                             color = when {
                                 batteryPercent <= 10 -> Color(0xFFFF4444)
-                                batteryPercent <= 20 -> Color(0xFF8B5CF6)
+                                batteryPercent <= 20 -> Color(0xFFFBBF24)
                                 else -> Color(0xFF10B981)
                             },
                             modifier = Modifier.weight(1f)
@@ -499,7 +505,7 @@ class MainActivity : ComponentActivity() {
                             color = when (thermalState) {
                                 "CRITICAL" -> Color(0xFFFF4444)
                                 "THROTTLE" -> Color(0xFFFF8C00)
-                                "WARNING" -> Color(0xFF8B5CF6)
+                                "WARNING" -> Color(0xFFFBBF24)
                                 else -> Color(0xFF10B981)
                             },
                             modifier = Modifier.weight(1f)
@@ -599,9 +605,9 @@ class MainActivity : ComponentActivity() {
         }
         val statusColor = when {
             isRunning -> Color(0xFF10B981)
-            poolState == MiningService.PoolState.CONNECTING -> Color(0xFF8B5CF6)
-            poolState == MiningService.PoolState.CONNECTED -> Color(0xFF8B5CF6)
-            poolState == MiningService.PoolState.ERROR -> Color(0xFF8B5CF6)  // yellow, not red
+            poolState == MiningService.PoolState.CONNECTING -> Color(0xFFFBBF24)
+            poolState == MiningService.PoolState.CONNECTED -> Color(0xFF10B981)
+            poolState == MiningService.PoolState.ERROR -> Color(0xFFFBBF24)  // amber, not red
             else -> Color.Gray
         }
         // Right-side pool line
@@ -609,9 +615,9 @@ class MainActivity : ComponentActivity() {
             MiningService.PoolState.CONNECTED ->
                 "POOL: ONLINE" to Color(0xFF10B981)
             MiningService.PoolState.CONNECTING ->
-                "POOL: CONNECTING..." to Color(0xFF8B5CF6)
+                "POOL: CONNECTING..." to Color(0xFFFBBF24)
             MiningService.PoolState.ERROR ->
-                "POOL: ${(poolErrorReason ?: "ERROR").uppercase()}" to Color(0xFF8B5CF6)
+                "POOL: ${(poolErrorReason ?: "ERROR").uppercase()}" to Color(0xFFFBBF24)
             MiningService.PoolState.DISCONNECTED ->
                 "POOL: OFFLINE" to Color(0xFFFF4444)
         }
@@ -648,7 +654,7 @@ class MainActivity : ComponentActivity() {
                     if (difficulty > 0) {
                         Text(
                             "DIFF: ${String.format(java.util.Locale.US, "%.4f", difficulty)}",
-                            color = Color(0xFF8B5CF6),
+                            color = Color(0xFF70C7BA),
                             fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace
                         )
@@ -674,7 +680,7 @@ class MainActivity : ComponentActivity() {
         }
         val fg = when (severity) {
             MiningService.ProtectionSeverity.CRITICAL -> Color(0xFFFF6B6B)
-            MiningService.ProtectionSeverity.WARNING -> Color(0xFF8B5CF6)
+            MiningService.ProtectionSeverity.WARNING -> Color(0xFFFBBF24)
             MiningService.ProtectionSeverity.INFO -> Color(0xFF10B981)
             MiningService.ProtectionSeverity.NONE -> Color.White
         }
@@ -950,7 +956,7 @@ class MainActivity : ComponentActivity() {
                         popServerUrl.isBlank() ->
                             "Not configured" to Color.Gray
                         popPairingRequired || !hasStoredKey ->
-                            "Pairing required — enter code from OverManager" to Color(0xFF8B5CF6)
+                            "Pairing required — enter code from OverManager" to Color(0xFFFBBF24)
                         popLastStatus == "reporting" ->
                             "Paired · reporting" to Color(0xFF10B981)
                         popLastStatus == "error" ->
@@ -1284,7 +1290,7 @@ class MainActivity : ComponentActivity() {
                     TempSlider(
                         label = "Warn at",
                         value = warnTemp,
-                        color = Color(0xFF8B5CF6),
+                        color = Color(0xFFFBBF24),
                         onValueChange = {
                             warnTemp = it
                             prefs.warnTempC = it
@@ -1558,7 +1564,7 @@ class MainActivity : ComponentActivity() {
         val labelColor = Color.White
         val subColor = Color.Gray
         val pickColor = Color(0xFF10B981)
-        val cpuHintColor = Color(0xFF8B5CF6)
+        val cpuHintColor = Color(0xFF70C7BA)
         val unusableColor = Color(0xFF666666)
 
         Card(
@@ -2037,7 +2043,7 @@ class MainActivity : ComponentActivity() {
                         "$ts $tag ${entry.message}",
                         color = when (entry.level) {
                             LogLevel.ERROR -> Color(0xFFFF4444)
-                            LogLevel.WARN -> Color(0xFF8B5CF6)
+                            LogLevel.WARN -> Color(0xFFFBBF24)
                             LogLevel.INFO -> Color(0xFF10B981)
                         },
                         fontSize = 12.sp,

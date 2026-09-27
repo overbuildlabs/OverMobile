@@ -171,6 +171,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         // Load saved mining config so telemetry has meaningful pool/worker values
         // even when the miner isn't actively running yet.
         val prefs = getSharedPreferences("kas_miner", Context.MODE_PRIVATE)
+        PoolMigration.migrateSaved(prefs)
         val savedPoolUrl = prefs.getString("pool_url", "") ?: ""
         if (savedPoolUrl.isNotEmpty()) {
             val cleaned = savedPoolUrl.replace("stratum+tcp://", "")

@@ -58,7 +58,7 @@ After first launch, open **Settings**:
 
 | Field | What to set |
 | --- | --- |
-| **Pool URL** | `stratum+tcp://host:port` — e.g. `stratum+tcp://pool.proofofprints.com:5558` |
+| **Pool URL** | `stratum+tcp://host:port` — e.g. `stratum+tcp://pool.overbuildlabs.com:5558` |
 | **Wallet Address** | Your `kaspa:…` payout address. Paste it, or tap **Scan QR** to use the camera |
 | **Worker Name** | Any label you like — shows up in pool stats. Defaults to `OverMobile` |
 | **Threads** | How many CPU cores to mine on. More threads = more heat and battery drain |

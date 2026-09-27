@@ -74,4 +74,4 @@ internal object FieldValidators {
 }
 
 /** Default pool URL used when the user hasn't saved their own yet. */
-internal const val DEFAULT_POOL_URL = "stratum+tcp://pool.proofofprints.com:5558"
+internal const val DEFAULT_POOL_URL = "stratum+tcp://pool.overbuildlabs.com:5558"
