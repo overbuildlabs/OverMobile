@@ -55,8 +55,8 @@ class SplashActivity : ComponentActivity() {
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Image(
-                    painter = painterResource(id = R.drawable.overbuild_logo_large),
-                    contentDescription = "OverBuild Labs Logo",
+                    painter = painterResource(id = R.drawable.ic_overmobile_mark),
+                    contentDescription = "OverMobile logo",
                     modifier = Modifier.size(180.dp)
                 )
 

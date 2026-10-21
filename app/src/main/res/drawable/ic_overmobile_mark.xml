@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- OverMobile product mark (faceted OverBuild hexagon, phone holding the
+     company cube). Hand-converted from docs/brand/overmobile-mark.svg so the
+     in-app logo is the same artwork as the launcher icon and stays crisp at
+     any size. If the SVG changes, regenerate this file from it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="256dp"
+    android:height="256dp"
+    android:viewportWidth="256"
+    android:viewportHeight="256">
+    <path android:fillColor="#131316"
+        android:pathData="M128,36 L207.67,82 L207.67,174 L128,220 L48.33,174 L48.33,82 Z"/>
+    <group android:translateY="7">
+        <path android:strokeColor="#4B2298" android:strokeWidth="16"
+            android:pathData="M107,62 H149 A13,13 0 0 1 162,75 V175 A13,13 0 0 1 149,188 H107 A13,13 0 0 1 94,175 V75 A13,13 0 0 1 107,62 Z"/>
+    </group>
+    <path android:strokeColor="#9E77EC" android:strokeWidth="16"
+        android:pathData="M107,62 H149 A13,13 0 0 1 162,75 V175 A13,13 0 0 1 149,188 H107 A13,13 0 0 1 94,175 V75 A13,13 0 0 1 107,62 Z"/>
+    <path android:fillColor="#C9B5F6" android:pathData="M128,98 L150,111 L128,124 L106,111 Z"/>
+    <path android:fillColor="#9E77EC" android:pathData="M106,111 L128,124 L128,150 L106,137 Z"/>
+    <path android:fillColor="#693AC8" android:pathData="M128,124 L150,111 L150,137 L128,150 Z"/>
+    <path android:fillColor="#3EB689" android:pathData="M128,10 L230.19,69 L207.67,82 L128,36 Z"/>
+    <path android:fillColor="#308967" android:pathData="M230.19,69 L230.19,187 L207.67,174 L207.67,82 Z"/>
+    <path android:fillColor="#308967" android:pathData="M230.19,187 L128,246 L128,220 L207.67,174 Z"/>
+    <path android:fillColor="#235F46" android:pathData="M128,246 L25.81,187 L48.33,174 L128,220 Z"/>
+    <path android:fillColor="#235F46" android:pathData="M25.81,187 L25.81,69 L48.33,82 L48.33,174 Z"/>
+    <path android:fillColor="#3EB689" android:pathData="M25.81,69 L128,10 L128,36 L48.33,82 Z"/>
+</vector>

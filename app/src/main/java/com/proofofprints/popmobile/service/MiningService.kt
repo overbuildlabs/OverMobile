@@ -18,6 +18,7 @@ import android.net.wifi.WifiManager
 import android.os.PowerManager
 import android.util.Log
 import com.proofofprints.popmobile.LogManager
+import com.proofofprints.popmobile.R
 import com.proofofprints.popmobile.mining.MiningEngine
 import com.proofofprints.popmobile.popmanager.PoPManagerReporter
 import com.proofofprints.popmobile.stratum.StratumClient
@@ -904,7 +905,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("OverMobile")
             .setContentText(status)
-            .setSmallIcon(android.R.drawable.ic_menu_manage)
+            .setSmallIcon(R.drawable.ic_stat_overmobile)
             .setContentIntent(pendingIntent)
             .addAction(Notification.Action.Builder(
                 null, "Stop Mining", stopIntent
