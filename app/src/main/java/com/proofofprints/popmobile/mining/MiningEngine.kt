@@ -14,7 +14,7 @@ class MiningEngine {
         /** Sentinel string in every log line from this class. Bump whenever we
          *  push new diagnostic code so we can `adb logcat | grep BUILD_MARKER`
          *  and be sure the device has the latest native+kotlin. */
-        const val BUILD_MARKER = "BUILD_MARKER_2026-04-22-poller"
+        const val BUILD_MARKER = "BUILD_MARKER_2026-10-21-hardening"
 
         init {
             System.loadLibrary("popmobile")
@@ -47,14 +47,25 @@ class MiningEngine {
         fun onShareFound(jobId: String, nonce: Long)
     }
 
+    // Start/stop are reached from the stratum reader, the stats loop, the UI
+    // and onDestroy. The native side serialises them too; locking here keeps
+    // the Kotlin-visible order the same as the native one.
+    @Synchronized
     fun start(numThreads: Int) {
         Log.i(TAG, "Starting mining with $numThreads threads")
         nativeStart(numThreads)
     }
 
+    @Synchronized
     fun stop() {
         Log.i(TAG, "Stopping mining")
         nativeStop()
+    }
+
+    /** Zero accepted/rejected share counts. Call when the user starts a new
+     *  session; engine restarts for throttling keep the session's counts. */
+    fun resetStats() {
+        try { nativeResetStats() } catch (e: LinkageError) { warnLinkage("nativeResetStats", e) }
     }
 
     val isRunning: Boolean
@@ -129,6 +140,7 @@ class MiningEngine {
     private external fun nativeGetSharesFound(): Int
     private external fun nativeGetSharesRejected(): Int
     private external fun nativeIncrementRejected()
+    private external fun nativeResetStats()
     private external fun nativeSetShareCallback(callback: ShareCallback?)
     private external fun nativeSetTargetFromDifficulty(difficulty: Double, targetOut: ByteArray)
     private external fun nativeSetExtranonce(extranoncePrefix: Long, extranonce2Bits: Int)
