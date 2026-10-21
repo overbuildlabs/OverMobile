@@ -173,42 +173,37 @@ bool check_difficulty(const uint8_t *hash, const uint8_t *target) {
 }
 
 void set_target_from_difficulty(double difficulty, uint8_t *target) {
-    if (difficulty <= 0) difficulty = 0.0001;
+    /* NaN and +/-inf slip past a plain `<= 0` test; treat any non-finite or
+     * non-positive value as the old floor rather than hashing against garbage. */
+    if (!(difficulty > 0.0) || !isfinite(difficulty)) difficulty = 0.0001;
 
-    /* Ported from KASDeck: target = (2^224 - 1) / difficulty
-     * MAX_TARGET = 2^224 - 1 (LE bytes [0..27] = 0xFF, [28..31] = 0x00)
-     * Uses byte-by-byte multiply with carry propagation.
-     * This matches the rusty-kaspa bridge's default target computation. */
+    /* target = (2^224 - 1) / difficulty, as a 256-bit little-endian integer.
+     * This is the rusty-kaspa bridge's share target.
+     *
+     * The previous version truncated 1/difficulty to an integer, which is off
+     * by up to a few percent for fractional difficulties and collapses every
+     * difficulty above 1 to the difficulty-1 target (so the pool would reject
+     * nearly every share). Instead, split difficulty = mant * 2^exp with
+     * mant in [0.5, 1): then 2^224 / difficulty = (1/mant) * 2^(224 - exp).
+     * 1/mant is in (1, 2], so q = (1/mant) * 2^62 is a 63/64-bit integer that
+     * keeps the full double precision; it is placed at bit 224 - exp - 62.
+     * Using 2^224 instead of 2^224 - 1 changes the result by under 1 ulp. */
 
     memset(target, 0, 32);
 
-    double multiplier = 1.0 / difficulty;
+    int exp;
+    double mant = frexp(difficulty, &exp);
+    uint64_t q = (uint64_t)ldexp(1.0 / mant, 62);
+    int shift = 224 - exp - 62;
 
-    /* Overflow check: if multiplier >= 2^32, target overflows uint256 → cap at all-FF */
-    if (multiplier >= 4294967296.0) {
+    if (shift + 63 >= 256) {
+        /* Easier than the largest representable target: accept everything. */
         memset(target, 0xFF, 32);
         return;
     }
-
-    uint64_t mult_int = (uint64_t)multiplier;
-    if (mult_int == 0) mult_int = 1;
-
-    /* Compute (2^224 - 1) * mult_int with byte-by-byte carry propagation.
-     * MAX_TARGET in LE: bytes [0..27] = 0xFF, bytes [28..31] = 0x00 */
-    uint64_t carry = 0;
-    /* Bytes 0-27: each source byte is 0xFF */
-    for (int i = 0; i < 28; i++) {
-        uint64_t val = (uint64_t)0xFF * mult_int + carry;
-        target[i] = (uint8_t)(val & 0xFF);
-        carry = val >> 8;
-    }
-    /* Bytes 28-31: source is 0x00, propagate remaining carry */
-    for (int i = 28; i < 32; i++) {
-        target[i] = (uint8_t)(carry & 0xFF);
-        carry >>= 8;
-    }
-    /* If carry still overflows, cap at 2^256 - 1 */
-    if (carry > 0) {
-        memset(target, 0xFF, 32);
+    for (int bit = 0; bit < 64; bit++) {
+        if (!((q >> bit) & 1)) continue;
+        int pos = shift + bit;
+        if (pos >= 0) target[pos / 8] |= (uint8_t)(1u << (pos % 8));
     }
 }

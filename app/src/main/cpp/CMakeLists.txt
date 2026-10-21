@@ -22,4 +22,4 @@ add_library(popmobile SHARED
 target_include_directories(popmobile PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 find_library(log-lib log)
-target_link_libraries(popmobile ${log-lib})
+target_link_libraries(popmobile ${log-lib} m)
