@@ -1,5 +1,5 @@
 /**
- * OverManager reporter — pushes miner telemetry to a OverManager instance AND
+ * OverManager reporter — pushes miner telemetry to an OverManager instance AND
  * executes commands returned in the report response.
  *
  * Key design points:
@@ -43,12 +43,20 @@ class PoPManagerReporter(
         private const val KEY_REPORT_URL = "report_url"
         private const val KEY_DEVICE_NAME = "device_name"
         private const val KEY_SERVER_URL = "server_url"
+        /** serverUrl the stored apiKey/reportUrl were issued by. */
+        private const val KEY_CREDS_SERVER = "creds_server_url"
         private const val KEY_PENDING_ACKS = "pending_acks"  // JSON array
         private const val KEY_APPLIED_IDS = "applied_command_ids"  // JSON array (for dedup)
         private const val DEFAULT_INTERVAL_SECONDS = 30
         private const val CONNECT_TIMEOUT_MS = 5000
         private const val READ_TIMEOUT_MS = 8000
         private const val MAX_APPLIED_HISTORY = 200
+        /** Bounds for the server-chosen report interval; 0 or negative made
+         *  the loop post continuously. */
+        private const val MIN_INTERVAL_SECONDS = 10
+        private const val MAX_INTERVAL_SECONDS = 3600
+        /** Largest HTTP response body we read from OverManager. */
+        private const val MAX_RESPONSE_BYTES = 1_000_000
     }
 
     /** Supplies live stats to the reporter on each tick. */
@@ -97,7 +105,10 @@ class PoPManagerReporter(
     private val gson = Gson()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var reportJob: Job? = null
-    private var intervalSeconds: Int = DEFAULT_INTERVAL_SECONDS
+    @Volatile private var intervalSeconds: Int = DEFAULT_INTERVAL_SECONDS
+    /** sendReport runs from the loop and from reportNow(); without this both
+     *  could receive and execute the same command batch. */
+    private val reportLock = Any()
 
     @Volatile private var commandExecutor: CommandExecutor? = null
 
@@ -215,6 +226,28 @@ class PoPManagerReporter(
 
     // ===== Lifecycle =====
 
+    /** Drop credentials that were issued by a different server than the one
+     *  now configured. Settings can rewrite server_url directly in prefs, so
+     *  this is checked wherever the URL is about to be used; otherwise the
+     *  old server kept receiving telemetry and sending commands. */
+    private fun dropCredentialsIfServerChanged() {
+        if (apiKey == null) return
+        val current = serverUrl
+        val issuer = prefs.getString(KEY_CREDS_SERVER, null)
+        if (issuer == null) {
+            // Paired before this check existed: adopt the current server.
+            prefs.edit().putString(KEY_CREDS_SERVER, current).apply()
+            return
+        }
+        if (!issuer.equals(current, ignoreCase = true)) {
+            Log.i(TAG, "Server URL changed — clearing credentials for the old server")
+            LogManager.info("OverManager server changed — pair with the new server")
+            clearCredentials()
+            pairingRequired = true
+            lastStatus = "pairing_required"
+        }
+    }
+
     /** Start the periodic report loop. Safe to call repeatedly. Loop runs forever
      *  until [stop] is called, regardless of mining state. */
     fun start() {
@@ -224,6 +257,7 @@ class PoPManagerReporter(
             Log.d(TAG, "Reporter disabled (no server URL)")
             return
         }
+        dropCredentialsIfServerChanged()
         if (reportJob?.isActive == true) {
             Log.d(TAG, "Reporter already running")
             return
@@ -257,7 +291,7 @@ class PoPManagerReporter(
                         delay(5_000L)
                         continue
                     }
-                    sendReport()
+                    synchronized(reportLock) { sendReport() }
                 } catch (e: Exception) {
                     Log.w(TAG, "Report cycle error: ${e.message}")
                 }
@@ -277,7 +311,7 @@ class PoPManagerReporter(
      *  OverManager sees the status change without waiting for the next tick). */
     fun reportNow() {
         scope.launch {
-            try { sendReport() } catch (e: Exception) {
+            try { synchronized(reportLock) { sendReport() } } catch (e: Exception) {
                 Log.w(TAG, "reportNow error: ${e.message}")
             }
         }
@@ -288,6 +322,7 @@ class PoPManagerReporter(
         prefs.edit()
             .remove(KEY_API_KEY)
             .remove(KEY_REPORT_URL)
+            .remove(KEY_CREDS_SERVER)
             .apply()
         Log.i(TAG, "Credentials cleared")
     }
@@ -309,12 +344,36 @@ class PoPManagerReporter(
     /** Persist the apiKey/reportUrl/interval returned by a successful /register. */
     private fun persistRegistration(json: JsonObject) {
         val key = json.get("apiKey").asString
-        val url = json.get("reportUrl").asString
-        intervalSeconds = json.get("reportIntervalSeconds")?.asInt ?: DEFAULT_INTERVAL_SECONDS
+        val url = sameOriginReportUrl(json.get("reportUrl").asString)
+        intervalSeconds = clampInterval(json.get("reportIntervalSeconds")?.takeIf { !it.isJsonNull }?.asInt)
         prefs.edit()
             .putString(KEY_API_KEY, key)
             .putString(KEY_REPORT_URL, url)
+            .putString(KEY_CREDS_SERVER, serverUrl)
             .apply()
+    }
+
+    private fun clampInterval(v: Int?): Int =
+        (v ?: DEFAULT_INTERVAL_SECONDS).coerceIn(MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS)
+
+    /** The register response names the URL to post reports to. Keep only its
+     *  path and send it to the server the user configured, so a spoofed or
+     *  misconfigured response can't redirect the API key and telemetry to
+     *  another host. (OverManager may describe itself by IP while the user
+     *  typed a hostname, so a strict same-origin check would break pairing.) */
+    private fun sameOriginReportUrl(raw: String): String {
+        val base = serverUrl.trimEnd('/')
+        return try {
+            val u = URL(URL(base + "/"), raw)
+            val configured = URL(base)
+            if (!u.host.equals(configured.host, ignoreCase = true) || u.port != configured.port) {
+                Log.w(TAG, "Register returned reportUrl on ${u.host}:${u.port}; using configured server")
+            }
+            val pathAndQuery = (u.path.ifEmpty { "/" }) + (u.query?.let { "?$it" } ?: "")
+            base + pathAndQuery
+        } catch (e: Exception) {
+            throw IllegalArgumentException("Invalid reportUrl from server")
+        }
     }
 
     /** Background reconnect path — uses the stored apiKey, never sends a
@@ -401,6 +460,9 @@ class PoPManagerReporter(
                 pairingRequired = false
                 lastStatus = "reporting"
                 lastError = null
+                // start() is a no-op if the loop is already running; it
+                // wasn't if the service started before a server was set.
+                start()
                 // Wake up the report loop so the first real report fires now
                 reportNow()
                 Result.success("Paired with OverManager")
@@ -441,6 +503,7 @@ class PoPManagerReporter(
         // If we have no credentials at all, we need the user to pair — the
         // caller (start() loop) should have skipped to the idle branch, but
         // guard here too.
+        dropCredentialsIfServerChanged()
         if (apiKey == null) {
             pairingRequired = true
             lastStatus = "pairing_required"
@@ -503,12 +566,16 @@ class PoPManagerReporter(
                 200 -> {
                     // Acks were accepted (if any) — clear the queue.
                     if (pendingAcks.isNotEmpty()) {
-                        savePendingAcks(emptyList())
+                        // Remove only what we sent; keep anything queued since.
+                        val sent = pendingAcks.mapTo(HashSet()) { it.id to it.status }
+                        savePendingAcks(loadPendingAcks().filterNot { (it.id to it.status) in sent })
                         Log.d(TAG, "Cleared ${pendingAcks.size} acks after successful report")
                     }
 
                     val json = gson.fromJson(response.body, JsonObject::class.java)
-                    intervalSeconds = json?.get("nextReportIn")?.asInt ?: intervalSeconds
+                    json?.get("nextReportIn")?.takeIf { it.isJsonPrimitive }?.asInt?.let {
+                        intervalSeconds = clampInterval(it)
+                    }
                     lastReportAt = System.currentTimeMillis()
                     lastStatus = "reporting"
                     lastError = null
@@ -517,7 +584,8 @@ class PoPManagerReporter(
                     val commandsEl = json?.get("commands")
                     if (commandsEl != null && commandsEl.isJsonArray) {
                         val commandsArr = commandsEl.asJsonArray
-                        Log.d(TAG, "Got commands: $commandsArr")
+                        // Params can include the wallet; keep them out of release logcat.
+                        Log.d(TAG, "Got ${commandsArr.size()} commands")
                         if (commandsArr.size() > 0) {
                             processCommands(commandsArr)
                         }
@@ -584,7 +652,7 @@ class PoPManagerReporter(
             }
 
             val cmd = Command(id = id, type = type, params = params)
-            Log.d(TAG, "Executing: ${cmd.type} ${cmd.params}")
+            Log.d(TAG, "Executing: ${cmd.type}")
             LogManager.info("OverManager command: ${cmd.type}")
 
             if (executor == null) {
@@ -613,6 +681,20 @@ class PoPManagerReporter(
 
     // ===== HTTP =====
 
+    /** Read a response body as UTF-8, refusing anything over MAX_RESPONSE_BYTES
+     *  so a hostile or broken server can't exhaust memory. */
+    private fun readCapped(input: java.io.InputStream): String = input.use { s ->
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        while (true) {
+            val n = s.read(buf)
+            if (n < 0) break
+            if (out.size() + n > MAX_RESPONSE_BYTES) throw java.io.IOException("Response too large")
+            out.write(buf, 0, n)
+        }
+        out.toString(Charsets.UTF_8.name())
+    }
+
     private data class HttpResponse(val code: Int, val body: String)
 
     private fun httpPost(
@@ -636,9 +718,7 @@ class PoPManagerReporter(
             OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(json) }
 
             val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
-            val body = stream?.let {
-                BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { r -> r.readText() }
-            } ?: ""
+            val body = stream?.let { readCapped(it) } ?: ""
             return HttpResponse(conn.responseCode, body)
         } finally {
             conn.disconnect()
@@ -655,8 +735,7 @@ class PoPManagerReporter(
             conn.readTimeout = READ_TIMEOUT_MS
             try {
                 if (conn.responseCode == 200) {
-                    val body = BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8))
-                        .use { it.readText() }
+                    val body = readCapped(conn.inputStream)
                     val json = gson.fromJson(body, JsonObject::class.java)
                     val version = json?.get("version")?.asString ?: "unknown"
                     Result.success("Connected (v$version)")

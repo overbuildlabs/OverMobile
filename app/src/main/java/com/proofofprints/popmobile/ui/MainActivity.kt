@@ -243,7 +243,11 @@ class MainActivity : ComponentActivity() {
                 // being applied. Only update when the stored value differs
                 // from the current state to avoid fighting user input while
                 // they're typing in the Settings panel.
-                val freshPoolUrl = prefs.getString("pool_url", "") ?: ""
+                // Same default as the initial value above: a fresh install has
+                // no saved pool_url, and reading "" here wiped the prefilled
+                // default a second after launch.
+                val freshPoolUrl = prefs.getString("pool_url", null)?.takeIf { it.isNotBlank() }
+                    ?: DEFAULT_POOL_URL
                 if (freshPoolUrl != poolUrl && !showSettings) poolUrl = freshPoolUrl
                 val freshWallet = prefs.getString("wallet", "") ?: ""
                 if (freshWallet != wallet && !showSettings) wallet = freshWallet
@@ -791,7 +795,9 @@ class MainActivity : ComponentActivity() {
         onThreadsChange: (Int) -> Unit,
         onSave: () -> Unit
     ) {
-        val maxThreads = Runtime.getRuntime().availableProcessors()
+        // The native engine runs at most 8 workers (MAX_THREADS in
+        // mining_engine.c); offering more would show a count it never uses.
+        val maxThreads = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
         var showSaved by remember { mutableStateOf(false) }
 
         // OverManager settings (read/write directly against the popmanager prefs file
@@ -900,11 +906,13 @@ class MainActivity : ComponentActivity() {
 
                     // Thread count slider
                     Text("Threads: $threads / $maxThreads", color = Color.White, fontFamily = FontFamily.Monospace)
-                    Slider(
-                        value = threads.toFloat(),
+                    // A one-core device has nothing to choose (and steps = -1
+                    // would throw), so only show the slider when there is.
+                    if (maxThreads > 1) Slider(
+                        value = threads.toFloat().coerceIn(1f, maxThreads.toFloat()),
                         onValueChange = { onThreadsChange(it.roundToInt()) },
                         valueRange = 1f..maxThreads.toFloat(),
-                        steps = maxThreads - 2,
+                        steps = (maxThreads - 2).coerceAtLeast(0),
                         colors = SliderDefaults.colors(
                             thumbColor = Color(0xFF10B981),
                             activeTrackColor = Color(0xFF10B981)
@@ -1108,6 +1116,14 @@ class MainActivity : ComponentActivity() {
                                             .putString("server_url", popServerUrl.trimEnd('/'))
                                             .putString("device_name", popDeviceName)
                                             .apply()
+                                        // Keep the service in the foreground so
+                                        // reporting continues once the app is
+                                        // backgrounded (Save does the same).
+                                        ContextCompat.startForegroundService(
+                                            this@MainActivity,
+                                            Intent(this@MainActivity, MiningService::class.java)
+                                                .setAction(MiningService.ACTION_ENSURE_RUNNING)
+                                        )
                                     }
                                     popPairing = false
                                 }
@@ -1178,11 +1194,9 @@ class MainActivity : ComponentActivity() {
                         .putString("device_name", popDeviceName)
                         .apply()
                     // Restart reporter so it picks up the new server URL /
-                    // device name. We don't clear credentials here: if the
-                    // user points at a different server, the reporter's 401
-                    // response from the new host will trigger re-pair
-                    // automatically. If the admin deletes the device from
-                    // OverManager, the 404 path does the same.
+                    // device name. If the URL now names a different server,
+                    // the reporter drops the old server's credentials and asks
+                    // for a pairing code (see dropCredentialsIfServerChanged).
                     miningService?.let { svc ->
                         svc.popManagerReporter.stop()
                         svc.popManagerReporter.start()
@@ -1849,7 +1863,7 @@ class MainActivity : ComponentActivity() {
             captureActivity = QrScannerActivity::class.java
         }
 
-    /** Parse a OverManager pairing QR payload of the form:
+    /** Parse an OverManager pairing QR payload of the form:
      *   {"v":1,"type":"popmanager-register","url":"...","code":"..."}
      *  On success calls [onResult] with the extracted server URL + code.
      *  On any validation failure shows a toast and returns. */
@@ -1862,31 +1876,46 @@ class MainActivity : ComponentActivity() {
             toast("QR code was empty")
             return
         }
-        val parsed = try {
+        // Every field read is guarded: a QR with "type":{} or "v":"1.1" made
+        // asString/asInt throw on the main thread and crashed the app.
+        val parsed = runCatching {
             com.google.gson.JsonParser.parseString(trimmed).asJsonObject
-        } catch (e: Exception) {
-            toast("Not a OverManager QR code")
+        }.getOrNull()
+        fun field(name: String): String? = runCatching {
+            parsed?.get(name)?.takeIf { it.isJsonPrimitive }?.asString
+        }.getOrNull()
+        if (parsed == null || field("type") != "popmanager-register") {
+            toast("Not an OverManager QR code")
             return
         }
-        val type = parsed.get("type")?.asString
-        if (type != "popmanager-register") {
-            toast("Not a OverManager QR code")
-            return
-        }
-        val version = parsed.get("v")?.asInt ?: 0
+        val version = field("v")?.toIntOrNull() ?: 0
         if (version > 1) {
-            toast("Update OverMiner Mobile to scan this code")
+            toast("Update OverMobile to scan this code")
             return
         }
-        val url = parsed.get("url")?.asString?.trim().orEmpty()
-        val code = parsed.get("code")?.asString?.trim().orEmpty()
+        val url = field("url")?.trim()?.trimEnd('/').orEmpty()
+        val code = field("code")?.filter { !it.isWhitespace() }.orEmpty()
         if (url.isEmpty() || code.isEmpty()) {
             toast("QR is missing server URL or code")
             return
         }
+        // Only a plain http(s) server address and a 6-digit code are valid;
+        // anything else is a malformed or hostile QR.
+        val host = runCatching { java.net.URL(url) }.getOrNull()
+            ?.takeIf { it.protocol == "http" || it.protocol == "https" }
+            ?.host?.takeIf { it.isNotEmpty() }
+        if (host == null) {
+            toast("QR has an invalid server URL")
+            return
+        }
+        if (code.length != 6 || !code.all { it in '0'..'9' }) {
+            toast("QR has an invalid pairing code")
+            return
+        }
         onResult(url, code)
         LogManager.info("Scanned OverManager pairing QR: $url")
-        toast("Pairing QR scanned")
+        // The QR decides which server gets control of this miner; show it.
+        toast("Pairing QR scanned — server: $host")
     }
 
     private fun toast(msg: String) {

@@ -1,4 +1,4 @@
-# Cutting a OverMobile release
+# Cutting an OverMobile release
 
 Checklist to produce a signed APK, compute its checksum, and publish a GitHub release. Paste-ready commands are Windows cmd (the project's primary build environment); macOS/Linux equivalents are shown where they differ.
 
