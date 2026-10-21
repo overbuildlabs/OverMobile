@@ -55,13 +55,6 @@ into pure functions), and the report-interval clamp. Native: a small host
 test (CMake `ctest` or the existing self-test vector) for
 `set_target_from_difficulty` and the kHeavyHash test vector.
 
-### R5 · P1 · Resume after a battery pause while charging
-`ThermalMonitor.combineWithBattery` maps low battery into the thermal state;
-the resume branch in `MiningService.statsUpdateLoop` requires `NORMAL`, so the
-battery WARNING band (up to 2× cutoff) blocks resume even while charging.
-Separate "paused for battery" from "paused for heat" and resume on
-`battery > cutoff + hysteresis` (e.g. +5 %).
-
 ### R6 · P1 · Service start/stop robustness
 - Run `stopMining`'s engine join off the main thread (it's bounded but can
   still stall the UI briefly).
@@ -113,6 +106,29 @@ nothing keys off it); release asset name `overmobile-vX.Y.Z.apk` everywhere
 (`docs/RELEASING.md`, README; the v1.2.0 asset was named `overminer-…`);
 notification channel display name "KAS Mining" → "Mining" (keep the channel
 id). Never touch the invariants in `CLAUDE.md`.
+
+### R15 · P2 · Settings edits and the running session
+Changing threads in Settings while mining has no effect until Stop/Start,
+and the dashboard then shows e.g. `4/6`, which reads as throttling. Unsaved
+Settings edits are silently replaced by the saved values about 1 s after
+leaving the screen (the prefs poll in `MainActivity.MinerDashboard`). Apply a
+saved thread count to the live session (as `set_threads` does) and either
+auto-save or warn about unsaved changes.
+
+### R16 · P2 · Notification says "Idle" while connecting or paused
+`MiningService.ensureRunningForReporting` checks `miningEngine.isRunning`;
+reopening the app while a session is connecting or paused replaces the
+notification with "Idle — reporting to OverManager". Check
+`isSessionActive` instead.
+
+### R17 · P3 · Display consistency
+Notification always shows `H/s` (dashboard scales to kH/MH, and should say
+`kH/s` not `KH/s`); the THREADS tile and thread warning use the error red;
+battery reads 100 % before the service binds. One shared formatter.
+
+### R18 · P3 · "connecting" status in telemetry — cross-repo
+OverManager sees `stopped` while the phone is connecting or waiting for its
+first job. Add a `connecting` status once OverManager accepts it.
 
 ---
 
@@ -218,5 +234,9 @@ together with R2; re-check the Compose + R8 crash noted in `build.gradle.kts`.
 
 ## Done
 
+- Oct 21 2026 review bug batch: R5 (battery pause resumes while charging)
+  plus unplugged-pause flapping, dashboard temperature colours, accepted-share
+  count, pool authorization errors, Back button — branch
+  `claude/project-thread-5ajqh1`.
 - Oct 2026 audit fixes and in-app logo — branch `claude/audit-hardening-roadmap`
   (see [AUDIT-2026-10.md](AUDIT-2026-10.md)).

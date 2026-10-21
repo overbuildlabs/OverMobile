@@ -46,6 +46,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   and the wallet no longer appears in release logcat.
 
 ### Fixed
+- **"Require charging" pauses now hold.** With the phone unplugged, the
+  miner restarted every 30 seconds and stopped again straight away. Each
+  pause now remembers its cause (heat, low battery, unplugged) and resumes
+  only when that cause clears; starting a session unplugged no longer
+  mines for a few seconds before pausing.
+- **Mining resumes after a low-battery pause once the phone charges**
+  past the cutoff + 5 %. Before, it stayed paused until the battery reached
+  twice the cutoff.
+- **The dashboard temperature uses your protection thresholds.** It turned
+  amber at 45 °C and red at 55 °C regardless of settings; it now follows
+  the warn / throttle / pause temperatures.
+- **"Shares" counts what the pool accepted.** The dashboard, notification
+  and OverManager's accepted-shares figure counted every share found,
+  including rejected and lost ones.
+- **A pool that rejects the wallet or worker name now says so** in the
+  status card, notification and log, instead of hashing on silently. A
+  share answered with `false` and no error now counts as rejected.
+- The Back button on Settings, Logs and About returns to the dashboard
+  instead of closing the app.
 - **Share difficulty above 1 was ignored.** The target was computed from an
   integer-truncated multiplier, so any pool difficulty above 1 produced the
   difficulty-1 target (the pool would reject almost every share) and
