@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Only the latest published release of OverMobile receives security updates. If you're on an older APK, update to the [most recent release](https://github.com/proofofprints/PoPMobile/releases) before reporting an issue.
+Only the latest published release of OverMobile receives security updates. If you're on an older APK, update to the [most recent release](https://github.com/overbuildlabs/overmobile/releases) before reporting an issue.
 
 | Version | Supported |
 | --- | --- |
@@ -15,8 +15,8 @@ Only the latest published release of OverMobile receives security updates. If yo
 
 Instead, report privately through either of these channels:
 
-- **GitHub private reporting** (preferred): visit [Report a vulnerability](https://github.com/proofofprints/PoPMobile/security/advisories/new) and submit a draft security advisory
-- **Email**: [support@proofofprints.com](mailto:support@proofofprints.com) with subject line `[OverMobile security]`
+- **GitHub private reporting** (preferred): visit [Report a vulnerability](https://github.com/overbuildlabs/overmobile/security/advisories/new) and submit a draft security advisory
+- **Email**: [support@overbuildlabs.com](mailto:support@overbuildlabs.com) with subject line `[OverMobile security]`
 
 Please include, where possible:
 
@@ -42,7 +42,7 @@ In scope:
 Out of scope (please report to the respective project):
 
 - The Kaspa network or any pool software — upstream at [kaspanet](https://github.com/kaspanet)
-- OverManager server — [proofofprints/OverManager](https://github.com/proofofprints/PoPManager)
+- OverManager server — [overbuildlabs/overmanager](https://github.com/overbuildlabs/overmanager)
 - Bugs that require an already-compromised device (e.g., root + hostile app already installed)
 - Missing security hardening that doesn't correspond to a concrete exploit
 

@@ -9,9 +9,11 @@ telemetry/remote control by the OverManager desktop dashboard.
 
 - Repo: `github.com/overbuildlabs/overmobile` (old `proofofprints/PoPMobile`
   URLs redirect there).
-- Open work lives in [`docs/ROADMAP.md`](docs/ROADMAP.md); the latest
-  security/bug audit is [`docs/AUDIT-2026-10.md`](docs/AUDIT-2026-10.md).
-  Pick a task from the roadmap, do it on a branch, tick it off in the same PR.
+- Open work lives in [`docs/ROADMAP.md`](docs/ROADMAP.md) (ids like R1, F3);
+  the latest security/bug audit is [`docs/AUDIT-2026-10.md`](docs/AUDIT-2026-10.md).
+  Pick an item, do it on a branch, move it to *Done* in the same PR.
+- Highest-priority open item: **R1** — OverManager commands are not
+  authenticated (LAN attacker can redirect payouts). Needs OverManager changes.
 
 ## Invariants — never change these without an explicit decision
 
@@ -55,6 +57,8 @@ app/src/main/
     update/                 in-app updater (GitHub Releases → DownloadManager → installer)
   res/drawable/ic_overmobile_mark.xml   in-app logo (vector of docs/brand/overmobile-mark.svg)
   res/drawable/ic_stat_overmobile.xml   notification icon
+  update/ApkVerifier.kt   hash + package + signer check before any install
+tools/typecheck/          cloud-session Kotlin type-check (see below)
 docs/
   brand/        logo sources (SVG is the source of truth)
   screenshots/  OverMobile_*.png — the OverBuild Labs website hot-links these
@@ -68,14 +72,20 @@ docs/
 
 - `./gradlew assembleDebug` (Windows: `gradlew assembleDebug`). AGP 8.2.2,
   Kotlin 1.9.22, Gradle 8.5, compileSdk/targetSdk 34, minSdk 26, NDK via CMake.
-- **Cloud sessions can't build**: the Android Gradle plugin and SDK aren't
-  available offline in the Claude Code cloud sandbox. Changes made there are
-  reviewed by reading, then built and run by the maintainer in Android Studio
-  (test device: TCL A600DL, Android 11). Say so in the PR; don't claim a build
-  passed.
-- There are no unit tests yet (see roadmap). Pure-Kotlin helpers
-  (`VersionCompare`, `FieldValidators`, `PoolMigration`, stratum parsing) are
-  the first candidates.
+- **Cloud sessions can't run Gradle** (no Android SDK in the Claude Code
+  cloud sandbox). What they *can* do:
+  - `tools/typecheck/typecheck.sh` — compiles every Kotlin source with
+    kotlinc against Android API jars from Maven (downloads ~250 MB into a
+    cache on first run). Run it after any Kotlin change. It's a type-check,
+    not a build: no resources, manifest merge, R8 or native code.
+  - Native code: `gcc -fsyntax-only` / host test harnesses with a stub
+    `android/log.h` (the engine compiles on Linux); ThreadSanitizer is
+    available for concurrency changes.
+  - XML: `python3 -c "import xml.dom.minidom as m; m.parse('file.xml')"`.
+  The maintainer builds and runs on a device in Android Studio (test device:
+  TCL A600DL, Android 11) before merging. Say in the PR what was and wasn't
+  verified; never claim a build or device test you didn't run.
+- No unit tests yet — roadmap R4.
 
 ## Conventions
 
@@ -96,4 +106,23 @@ docs/
 Good fan-out units for parallel agents, each on its own branch:
 one roadmap item per agent; or one review dimension per agent (security,
 Kotlin concurrency, native/JNI) reporting findings without editing, with a
-single session applying fixes. Give each agent the invariants table above.
+single session verifying and applying fixes (that's how the Oct 2026 audit
+was run). Give each agent the invariants table above and tell it whether it
+may edit. Two agents shouldn't edit the same file at once — `MainActivity.kt`
+and `MiningService.kt` are touched by most items.
+
+## Threading model (read before touching the service)
+
+- Native: N worker threads + 1 hashrate sampler thread. `mining_start/stop`
+  are serialised by `control_mutex`; job/extranonce state is under
+  `job_mutex`; the share callback holds a read lock on the JNI global ref.
+- `onShareFound` runs on a native worker thread — never block it; it posts
+  `submitShare` to `Dispatchers.IO`.
+- `StratumClient`: one reader coroutine per connection; `connectionGen`
+  ignores events from old connections; `disconnect()` is intentional and does
+  not call `onDisconnected`.
+- `MiningService`: `startMining`/`stopMining` from the main thread or the
+  reporter's IO thread; `statsUpdateLoop` owns throttle/pause transitions
+  after the first job starts the engine (`engineStartedOnce`).
+- `PoPManagerReporter`: report loop on IO; `sendReport` is serialised by
+  `reportLock`.

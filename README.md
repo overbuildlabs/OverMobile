@@ -1,6 +1,6 @@
 # OverMobile
 
-Kaspa kHeavyHash miner for Android, with optional [OverManager](https://github.com/proofofprints/PoPManager) integration for remote monitoring and control.
+Kaspa kHeavyHash miner for Android, with optional [OverManager](https://github.com/overbuildlabs/overmanager) integration for remote monitoring and control.
 
 > **Low hashrate expected on mobile devices.** Do not expect meaningful profit — treat it as lottery-style mining.
 
@@ -30,21 +30,21 @@ Kaspa kHeavyHash miner for Android, with optional [OverManager](https://github.c
 - Internet access (cellular or Wi-Fi) to reach the pool
 - A Kaspa wallet address (the payout goes here)
 
-> **Note:** v1 has been tested on the Android emulator and a single physical device (TCL A3X). Behavior on other Android versions and OEM skins has not been exhaustively verified — please [open an issue](https://github.com/proofofprints/PoPMobile/issues) if something misbehaves on your device.
+> **Note:** v1 has been tested on the Android emulator and a single physical device (TCL A3X). Behavior on other Android versions and OEM skins has not been exhaustively verified — please [open an issue](https://github.com/overbuildlabs/overmobile/issues) if something misbehaves on your device.
 
 ## Install
 
 ### Option A — Sideload the signed APK from Releases
 
-1. Download the latest `popmobile-vX.Y.Z.apk` from the [Releases page](https://github.com/proofofprints/PoPMobile/releases).
+1. Download the latest `popmobile-vX.Y.Z.apk` from the [Releases page](https://github.com/overbuildlabs/overmobile/releases).
 2. On your phone, allow **Install unknown apps** for your browser or file manager (Settings → Apps → Special app access).
 3. Tap the downloaded APK and confirm.
 
 ### Option B — Build from source
 
 ```bash
-git clone https://github.com/proofofprints/PoPMobile.git
-cd OverMobile
+git clone https://github.com/overbuildlabs/overmobile.git
+cd overmobile
 # Open in Android Studio, or build from the CLI:
 ./gradlew assembleDebug        # unsigned debug APK
 ./gradlew assembleRelease      # signed release APK (requires keystore.properties — see below)
@@ -75,7 +75,7 @@ All three are accepted; the app normalises to the bare form before saving.
 
 ## OverManager integration
 
-[OverManager](https://github.com/proofofprints/PoPManager) is a self-hosted dashboard that can monitor and control multiple Kaspa miners (including Iceriver ASICs and OverMobile instances).
+[OverManager](https://github.com/overbuildlabs/overmanager) is a self-hosted dashboard that can monitor and control multiple Kaspa miners (including Iceriver ASICs and OverMobile instances).
 
 ### Pair a device
 
@@ -150,7 +150,7 @@ The top-level `KASDeck.ino` and `KASDECK_PORT_REFERENCE.md` are the upstream ESP
 
 ## Contributing
 
-- **Bugs / feature requests**: [GitHub Issues](https://github.com/proofofprints/PoPMobile/issues)
+- **Bugs / feature requests**: [GitHub Issues](https://github.com/overbuildlabs/overmobile/issues)
 - **Pull requests**: welcome — please include a test plan and the device you tested on
 - **Play Store**: not a target. Google prohibits on-device cryptocurrency mining apps. Distribution is via direct APK, F-Droid, and Obtainium
 

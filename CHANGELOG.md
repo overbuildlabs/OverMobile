@@ -9,8 +9,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   company logo: the OverBuild Labs faceted hexagon holding a purple phone
   with the company cube inside. Same family as the OverManager icon.
   Launcher (adaptive, legacy and round) and the Play Store image are
-  regenerated from `docs/brand/overmobile-mark.svg`. The splash screen and
-  header still show the company logo.
+  regenerated from `docs/brand/overmobile-mark.svg`. The splash screen, top
+  bar and About card now show the same mark (as a vector, sharp at any
+  size), the status-bar notification uses a matching silhouette instead of
+  Android's generic gear, and Android 13+ themed icons are supported.
 - **Pool moves to `pool.overbuildlabs.com`.** New installs pre-fill
   `stratum+tcp://pool.overbuildlabs.com:5558`. Existing installs that saved
   `pool.proofofprints.com` are switched to `pool.overbuildlabs.com` (same
@@ -23,6 +25,55 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   required, log warnings) violet. Warnings are amber, readouts (shares,
   hashes, difficulty) are Kaspa teal, and a connected pool is emerald.
   Violet is kept for the brand mark only.
+
+### Security
+- **Remote settings are validated.** Pool URL, wallet and worker sent by
+  OverManager (`set_config`) go through the same checks as the Settings
+  screen, and a remote change of the payout wallet is written to the in-app
+  log. (OverManager commands are still unauthenticated on the LAN; signed
+  commands are on the roadmap.)
+- **Pairing is tied to its server.** Changing the OverManager server URL now
+  drops the old server's credentials and asks for a new pairing code; before,
+  the old server kept receiving telemetry and sending commands. The report
+  URL returned at pairing can no longer point reports at a different host.
+- **Updates are verified before install.** The downloaded APK must match the
+  SHA-256 GitHub publishes for it and be signed by OverBuild Labs, and only
+  assets from our own releases are accepted.
+- **The OverManager API key is excluded from Android backups and device
+  transfer**, so restoring a backup can't clone a paired miner.
+- Pool and OverManager responses are size-limited, pairing QR codes are
+  validated (http(s) URL, 6-digit code) and show the server they point to,
+  and the wallet no longer appears in release logcat.
+
+### Fixed
+- **Share difficulty above 1 was ignored.** The target was computed from an
+  integer-truncated multiplier, so any pool difficulty above 1 produced the
+  difficulty-1 target (the pool would reject almost every share) and
+  fractional difficulties were off by up to a few percent. Now exact.
+- **The miner now reconnects after the pool drops the connection.** A clean
+  close by the pool left the app hashing a stale job or stuck in error until
+  Stop/Start.
+- A remote pool change from OverManager no longer stops mining for good.
+- Double-tapping Start, or a remote start while connecting or paused, no
+  longer opens a second pool connection and a second wake lock.
+- Thermal throttling no longer resets the accepted-shares count.
+- Devices without a readable CPU temperature resume after a pause.
+- Stopping no longer risks freezing the app when the pool connection is dead;
+  shares are sent off the hashing threads.
+- Fixed crashes from a malformed pairing QR, an over-long pool extranonce,
+  an exception in the native share callback, and the thread slider on
+  one-core devices. Start/stop from several threads at once is now safe in
+  the native engine.
+- Fresh installs keep the prefilled default pool (it was wiped a second after
+  launch); the thread slider tops out at the engine's 8 threads.
+- A release with no notes no longer hides the update; rotating during an
+  update download no longer cancels it.
+- Pairing from a fresh install starts reporting right away.
+- The wake lock is renewed for sessions longer than 4 hours.
+
+### Build
+- Native library linked for 16 KB memory pages (Android 15+); static C++
+  runtime. Android 14 foreground-service type is declared.
 
 ## [1.2.0] — 2026-05-29
 ### Changed
