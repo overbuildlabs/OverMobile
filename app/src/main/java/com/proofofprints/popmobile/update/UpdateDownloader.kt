@@ -23,6 +23,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Environment
 import android.util.Log
+import com.proofofprints.popmobile.LogManager
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -72,7 +73,7 @@ class UpdateDownloader(private val context: Context) {
             .setMimeType("application/vnd.android.package-archive")
 
         val id = dm.enqueue(request)
-        savePendingId(id)
+        savePendingId(id, update.apkSha256)
 
         try {
             while (true) {
@@ -89,7 +90,15 @@ class UpdateDownloader(private val context: Context) {
 
                     when (status) {
                         DownloadManager.STATUS_SUCCESSFUL -> {
-                            emit(DownloadProgress.Complete(destFile))
+                            val problem = ApkVerifier.verify(context, destFile, update.apkSha256)
+                            if (problem != null) {
+                                clearPendingId()
+                                destFile.delete()
+                                LogManager.warn("Update rejected: $problem")
+                                emit(DownloadProgress.Failed("Update failed verification: $problem"))
+                            } else {
+                                emit(DownloadProgress.Complete(destFile))
+                            }
                             return@flow
                         }
                         DownloadManager.STATUS_FAILED -> {
@@ -107,8 +116,12 @@ class UpdateDownloader(private val context: Context) {
                 }
                 delay(500)
             }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // The dialog was disposed (e.g. rotation). Leave the download
+            // running: InstallReceiver installs it when it completes.
+            throw e
         } catch (e: Exception) {
-            Log.w(TAG, "Download cancelled / errored: ${e.message}")
+            Log.w(TAG, "Download errored: ${e.message}")
             dm.remove(id)
             clearPendingId()
             emit(DownloadProgress.Failed(e.message ?: "Cancelled"))
@@ -141,10 +154,11 @@ class UpdateDownloader(private val context: Context) {
         context.startActivity(intent)
     }
 
-    private fun savePendingId(id: Long) {
+    private fun savePendingId(id: Long, sha256: String?) {
         context.getSharedPreferences(PrefsKeys.PREFS, Context.MODE_PRIVATE)
             .edit()
             .putLong(PrefsKeys.PENDING_ID, id)
+            .putString(PrefsKeys.PENDING_SHA256, sha256)
             .apply()
     }
 

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ backup / device-transfer rules.
+     popmanager.xml holds the OverManager API key and this device's id:
+     restoring it onto another phone would clone the miner's identity and
+     hand the key to whoever restores the backup. update_checker.xml only
+     holds transient download state. Miner settings (pool, wallet, worker,
+     thresholds) are still backed up so a new phone keeps them. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="popmanager.xml" />
+        <exclude domain="sharedpref" path="update_checker.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="popmanager.xml" />
+        <exclude domain="sharedpref" path="update_checker.xml" />
+    </device-transfer>
+</data-extraction-rules>

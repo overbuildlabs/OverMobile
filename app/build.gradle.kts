@@ -39,7 +39,9 @@ android {
             cmake {
                 cppFlags += "-std=c++17"
                 cFlags += "-O3"
-                arguments += "-DANDROID_STL=c++_shared"
+                // Static C++ runtime: the JNI bridge uses no STL, and this
+                // avoids shipping libc++_shared.so (4 KB-aligned on older NDKs).
+                arguments += "-DANDROID_STL=c++_static"
             }
         }
     }

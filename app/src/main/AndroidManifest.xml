@@ -17,6 +17,8 @@
     <application
         android:name=".KASMinerApp"
         android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:label="@string/app_name"
@@ -42,7 +44,13 @@
         <service
             android:name=".service.MiningService"
             android:foregroundServiceType="specialUse"
-            android:exported="false" />
+            android:exported="false">
+            <!-- Required for specialUse foreground services on Android 14+
+                 (and by Play policy): says what the service is for. -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Cryptocurrency mining that the user starts and stops, with thermal and battery limits" />
+        </service>
 
         <!-- Portrait-locked QR scanner for capturing Kaspa wallet addresses -->
         <activity

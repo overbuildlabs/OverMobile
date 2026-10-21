@@ -23,3 +23,8 @@ target_include_directories(popmobile PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 find_library(log-lib log)
 target_link_libraries(popmobile ${log-lib} m)
+
+# 16 KB page-size support (Android 15+ devices; required for Play uploads).
+# Aligns the ELF LOAD segments; zip alignment of the packaged .so needs
+# AGP 8.5.1+ (see docs/ROADMAP.md).
+target_link_options(popmobile PRIVATE "-Wl,-z,max-page-size=16384")
