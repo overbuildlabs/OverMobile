@@ -92,7 +92,21 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         private set
     @Volatile var activeThreads: Int = 0
         private set
-    @Volatile private var thermalPaused: Boolean = false
+    /** Why the engine is paused within an active session, or null when it
+     *  isn't. Each reason resumes only once its own condition clears (see
+     *  [pauseBlocker]); a single shared flag used to let an unplugged pause
+     *  "resume" after the thermal cool-down hold and re-pause in the same
+     *  tick, every 30 s. */
+    enum class PauseReason { HEAT, BATTERY, UNPLUGGED }
+    @Volatile var pauseReason: PauseReason? = null
+        private set
+    private val thermalPaused: Boolean get() = pauseReason != null
+    /** Heat-only severity from the poller (thermalState minus battery). */
+    @Volatile private var heatState: ThermalMonitor.ThermalState = ThermalMonitor.ThermalState.NORMAL
+    /** True once the current connection has delivered a job. A resume before
+     *  that leaves the start to onNewJob instead of running the engine on a
+     *  stale job from an earlier connection. */
+    @Volatile private var hasJob: Boolean = false
     /** True once the engine has been started in the current session. The
      *  stats-update loop owns all start/stop transitions after the initial
      *  start; flipping this flag false on Stop / disconnect is what lets
@@ -119,6 +133,9 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
     /** How long the temperature must stay below resumeTempC before we'll
      *  bring mining back up from a thermal pause. */
     private val RESUME_HOLD_MS = 30_000L
+    /** A battery pause resumes only above cutoff + this many percent, so the
+     *  miner doesn't flap at the cutoff while charging. */
+    private val BATTERY_RESUME_HYSTERESIS = 5
 
     /** Banner to show above the Start/Stop button so the user can tell at a
      *  glance why mining has been paused, throttled, or is running with
@@ -143,6 +160,11 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
     val hashrateSessionAvg: Double get() = miningEngine.hashrate
     val totalHashes: Long get() = miningEngine.totalHashes
     val sharesFound: Int get() = miningEngine.sharesFound
+    /** Shares the pool acknowledged this session. The native counter above
+     *  counts shares found, including ones the pool later rejects or that
+     *  are lost on a disconnect, so it overstates "accepted". */
+    val sharesAccepted: Int get() = acceptedShares.get()
+    private val acceptedShares = java.util.concurrent.atomic.AtomicInteger(0)
     val sharesRejected: Int get() = miningEngine.sharesRejected
     val isRunning: Boolean get() = miningEngine.isRunning
     val isPoolConnected: Boolean get() = stratumClient.isConnected
@@ -217,6 +239,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                     batteryPercent = s.batteryPercent
                     isCharging = s.isCharging
                     thermalState = s.thermalState
+                    heatState = s.heatState
                     lastDeviceStatus = s
                     updateProtectionBanner(s)
                     // Refresh the foreground notification so the temp / banner
@@ -277,7 +300,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                 // Report live 60s windowed rate — smooth enough to avoid jitter,
                 // responsive enough to show thermal throttling as it happens.
                 hashrate = miningEngine.hashrate60s,
-                acceptedShares = miningEngine.sharesFound,
+                acceptedShares = sharesAccepted,
                 rejectedShares = miningEngine.sharesRejected,
                 difficulty = currentDifficulty,
                 runtimeSeconds = runtime,
@@ -436,6 +459,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                 // disconnect() is intentional, so onDisconnected doesn't run;
                 // reset here so onNewJob starts the engine on the new pool.
                 engineStartedOnce = false
+                hasJob = false
                 activeThreads = 0
                 poolState = PoolState.CONNECTING
                 stratumClient.connect(poolHost, poolPort, walletAddress, workerName)
@@ -516,6 +540,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         poolErrorReason = null
         miningStartedAt = System.currentTimeMillis()
         miningEngine.resetStats()
+        acceptedShares.set(0)
         // Reporter is already running from onCreate — just fire an immediate
         // status update so OverManager sees the transition quickly.
         popManagerReporter.reportNow()
@@ -588,10 +613,11 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         miningStartedAt = 0L
         // Clear thermal-pause state so the protection banner doesn't keep
         // claiming "PAUSED — cooling" once the user has stopped on their own.
-        thermalPaused = false
+        pauseReason = null
         coolingSince = 0L
         activeThreads = 0
         engineStartedOnce = false
+        hasJob = false
         statsJob?.cancel()
         statsJob = null
         reconnectJob?.cancel()
@@ -696,30 +722,61 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                 }
             }
 
-            // Mining actions driven by the cached thermalState
-            when (thermalState) {
-                ThermalMonitor.ThermalState.CRITICAL -> {
-                    if (miningEngine.isRunning) {
-                        Log.w(TAG, "THERMAL CRITICAL (${cpuTemp}°C) — pausing mining!")
-                        // Set the pause flag BEFORE stopping the engine so
-                        // onNewJob (on the StratumClient thread) can't observe
-                        // `!isRunning && !thermalPaused` during the stop
-                        // window and immediately restart mining.
-                        thermalPaused = true
-                        coolingSince = 0L
-                        activeThreads = 0
-                        miningEngine.stop()
-                        if (!isSessionActive) return
-                        // Refresh banner immediately — the next poller tick is
-                        // up to 3s away, by which time temp will have dropped
-                        // and the banner would say "cooling" rather than
-                        // surfacing the actual critical pause cause.
-                        updateProtectionBanner(lastDeviceStatus)
-                        onStatsUpdate?.invoke()
-                        onThermalWarning?.invoke(thermalState, cpuTemp)
-                    }
+            // Pause / resume / throttle. A pause records its reason and
+            // resumes only once every blocker is clear: a heat pause after a
+            // sustained cool-down, battery and unplugged pauses right away.
+            val heat = heatState
+            val blocker = pauseBlocker(heat)
+            val paused = pauseReason
+            if (blocker != null) {
+                coolingSince = 0L
+                if (paused != blocker) {
+                    pauseReason = blocker
+                    updateProtectionBanner(lastDeviceStatus)
                 }
+                if (miningEngine.isRunning) {
+                    Log.w(TAG, "Pausing mining: $blocker (${cpuTemp}°C, battery $batteryPercent%, charging=$isCharging)")
+                    activeThreads = 0
+                    // pauseReason is set before the stop so onNewJob (on the
+                    // StratumClient thread) can't see a stopped, unpaused
+                    // engine during the stop window and restart it.
+                    miningEngine.stop()
+                    if (!isSessionActive) return
+                    // Refresh the banner now rather than on the next poller
+                    // tick, which may already read a cooler temperature.
+                    updateProtectionBanner(lastDeviceStatus)
+                    onStatsUpdate?.invoke()
+                    if (blocker == PauseReason.HEAT) onThermalWarning?.invoke(thermalState, cpuTemp)
+                }
+            } else if (paused != null) {
+                val nowMs = System.currentTimeMillis()
+                val ready = when {
+                    paused != PauseReason.HEAT -> true
+                    coolingSince == 0L -> {
+                        coolingSince = nowMs
+                        Log.i(TAG, "Cooling observed (${cpuTemp}°C ≤ ${preferences.resumeTempC}°C) — holding for ${RESUME_HOLD_MS / 1000}s before resume")
+                        false
+                    }
+                    else -> nowMs - coolingSince >= RESUME_HOLD_MS
+                }
+                if (ready) {
+                    if (!isSessionActive) return
+                    Log.i(TAG, "Pause ($paused) cleared — resuming mining (${cpuTemp}°C, battery $batteryPercent%)")
+                    LogManager.info("Mining resumed")
+                    pauseReason = null
+                    coolingSince = 0L
+                    // No job on this connection yet: onNewJob starts the engine.
+                    if (hasJob && !miningEngine.isRunning) {
+                        miningEngine.start(threadCount)
+                        activeThreads = threadCount
+                        engineStartedOnce = true
+                    }
+                    updateProtectionBanner(lastDeviceStatus)
+                    onStatsUpdate?.invoke()
+                }
+            } else when (heat) {
                 ThermalMonitor.ThermalState.THROTTLE -> {
+                    coolingSince = 0L
                     val recommended = maxOf(1, threadCount / 2)
                     if (miningEngine.isRunning && recommended < activeThreads) {
                         Log.w(TAG, "THERMAL THROTTLE (${cpuTemp}°C) — reducing to $recommended threads")
@@ -736,43 +793,17 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                     }
                 }
                 ThermalMonitor.ThermalState.NORMAL -> {
-                    val nowMs = System.currentTimeMillis()
-                    // Devices with no readable sysfs zone (cpuTemp == 0) rely on
-                    // the OS thermal signal; NORMAL from it is cool enough.
-                    // Requiring cpuTemp > 0 left them paused forever.
-                    val coolEnough = cpuTemp <= 0f || cpuTemp <= preferences.resumeTempC
-
-                    if (thermalPaused && !miningEngine.isRunning) {
-                        if (coolEnough) {
-                            if (coolingSince == 0L) {
-                                coolingSince = nowMs
-                                Log.i(TAG, "Cooling observed (${cpuTemp}°C ≤ ${preferences.resumeTempC}°C) — holding for ${RESUME_HOLD_MS / 1000}s before resume")
-                            } else if (nowMs - coolingSince >= RESUME_HOLD_MS) {
-                                Log.i(TAG, "Cooldown complete (${cpuTemp}°C) — resuming mining")
-                                if (!isSessionActive) return
-                                miningEngine.start(threadCount)
-                                activeThreads = threadCount
-                                engineStartedOnce = true
-                                thermalPaused = false
-                                coolingSince = 0L
-                            }
-                        } else {
-                            coolingSince = 0L
-                        }
-                    } else if (miningEngine.isRunning && activeThreads < threadCount) {
-                        if (coolEnough) {
-                            if (coolingSince == 0L) {
-                                coolingSince = nowMs
-                                Log.i(TAG, "Cool enough to un-throttle (${cpuTemp}°C ≤ ${preferences.resumeTempC}°C, currently $activeThreads/$threadCount) — holding for ${RESUME_HOLD_MS / 1000}s")
-                            } else if (nowMs - coolingSince >= RESUME_HOLD_MS) {
-                                Log.i(TAG, "Restoring thread count $activeThreads → $threadCount (${cpuTemp}°C)")
-                                miningEngine.stop()
-                                if (!isSessionActive) return
-                                miningEngine.start(threadCount)
-                                activeThreads = threadCount
-                                coolingSince = 0L
-                            }
-                        } else {
+                    if (miningEngine.isRunning && activeThreads < threadCount && isCoolEnough()) {
+                        val nowMs = System.currentTimeMillis()
+                        if (coolingSince == 0L) {
+                            coolingSince = nowMs
+                            Log.i(TAG, "Cool enough to un-throttle (${cpuTemp}°C ≤ ${preferences.resumeTempC}°C, currently $activeThreads/$threadCount) — holding for ${RESUME_HOLD_MS / 1000}s")
+                        } else if (nowMs - coolingSince >= RESUME_HOLD_MS) {
+                            Log.i(TAG, "Restoring thread count $activeThreads → $threadCount (${cpuTemp}°C)")
+                            miningEngine.stop()
+                            if (!isSessionActive) return
+                            miningEngine.start(threadCount)
+                            activeThreads = threadCount
                             coolingSince = 0L
                         }
                     } else {
@@ -783,28 +814,37 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                     coolingSince = 0L
                     onThermalWarning?.invoke(thermalState, cpuTemp)
                 }
-            }
-
-            // Power-gate: if the user requires charging and we're not plugged
-            // in (and not on an external-power rig), pause the engine.
-            if (!preferences.externalPowerMode
-                && preferences.requireCharging
-                && !isCharging
-                && miningEngine.isRunning
-            ) {
-                Log.w(TAG, "Unplugged while requireCharging=true — pausing")
-                thermalPaused = true
-                coolingSince = 0L
-                activeThreads = 0
-                miningEngine.stop()
-                if (!isSessionActive) return
-                updateProtectionBanner(lastDeviceStatus)
-                onStatsUpdate?.invoke()
+                // CRITICAL heat is always a blocker, handled above.
+                ThermalMonitor.ThermalState.CRITICAL -> {}
             }
 
             delay(3000) // Check every 3 seconds
         }
         Log.i(TAG, "statsUpdateLoop EXITED (session=$isSessionActive)")
+    }
+
+    /** Devices with no readable sysfs zone (cpuTemp == 0) rely on the OS
+     *  thermal signal; NORMAL from it is cool enough. */
+    private fun isCoolEnough(): Boolean = cpuTemp <= 0f || cpuTemp <= preferences.resumeTempC
+
+    /** The condition that should keep (or put) the engine paused right now,
+     *  or null when mining may run. Order matches the banner's priority. */
+    private fun pauseBlocker(heat: ThermalMonitor.ThermalState): PauseReason? {
+        val current = pauseReason
+        // Same scope as before the split: the battery cutoff only applies
+        // with thermal protection on and outside external-power mode.
+        val batteryGuard = preferences.thermalProtectionEnabled && !preferences.externalPowerMode
+        val batteryResumeAt = preferences.batteryCutoffPercent +
+            if (current == PauseReason.BATTERY) BATTERY_RESUME_HYSTERESIS else 0
+        return when {
+            batteryGuard && batteryPercent in 1..batteryResumeAt -> PauseReason.BATTERY
+            !preferences.externalPowerMode && preferences.requireCharging && !isCharging ->
+                PauseReason.UNPLUGGED
+            heat == ThermalMonitor.ThermalState.CRITICAL -> PauseReason.HEAT
+            current == PauseReason.HEAT &&
+                (heat != ThermalMonitor.ThermalState.NORMAL || !isCoolEnough()) -> PauseReason.HEAT
+            else -> null
+        }
     }
 
     // ===== StratumListener callbacks =====
@@ -824,6 +864,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         poolState = if (isStopping) PoolState.DISCONNECTED else PoolState.ERROR
         poolErrorReason = if (isStopping) null else friendly
         miningEngine.stop()
+        hasJob = false
         // Allow onNewJob to bring the engine back up after the reconnect
         // succeeds. Without this, engineStartedOnce stays true and the first
         // job after reconnect would just update setJob without restarting
@@ -892,6 +933,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         LogManager.info("New job received: $jobId")
         val target = miningEngine.setTargetFromDifficulty(currentDifficulty)
         miningEngine.setJob(headerHash, jobId, target, timestamp)
+        hasJob = true
 
         // Initial start only — once the engine is up for this session, the
         // stats-update loop owns all subsequent start/stop transitions
@@ -919,6 +961,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
     override fun onShareAccepted() {
         Log.i(TAG, "Share accepted!")
         LogManager.info("Share accepted!")
+        acceptedShares.incrementAndGet()
         onShareSubmitted?.invoke()
     }
 
@@ -926,6 +969,17 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         Log.w(TAG, "Share rejected: $reason")
         LogManager.warn("Share rejected: $reason")
         miningEngine.incrementRejected()
+    }
+
+    override fun onAuthorizeFailed(reason: String) {
+        // Without this the miner hashed on with every share rejected and
+        // nothing on screen said why. The connection stays up; the pool
+        // decides whether to drop it.
+        Log.w(TAG, "Pool rejected authorization: $reason")
+        LogManager.error("Pool rejected wallet/worker: $reason")
+        poolState = PoolState.ERROR
+        poolErrorReason = "Wallet/worker rejected"
+        updateNotification("Pool rejected wallet/worker")
     }
 
     override fun onExtranonceSet(extranonce: String, extranonceShifted: Long, extranonce2Bits: Int) {
@@ -999,7 +1053,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         val text = status ?: String.format(
             java.util.Locale.US,
             "%.2f H/s | A:%d R:%d%s%s",
-            hashrate, sharesFound, sharesRejected, thermalInfo, protection
+            hashrate, sharesAccepted, sharesRejected, thermalInfo, protection
         )
         val nm = getSystemService(NotificationManager::class.java)
         nm.notify(NOTIFICATION_ID, createNotification(text))
@@ -1015,24 +1069,16 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         val t = status?.cpuTemp ?: 0f
         val tStr = if (t > 0f) "${t.toInt()}°C" else "—"
         val batt = status?.batteryPercent ?: 0
-        val charging = status?.isCharging ?: false
 
-        // --- Pause-driven (engine paused, identify the actual cause). Probe
-        //     each condition explicitly rather than reading the bucketed
-        //     ThermalState — combineWithBattery() can promote thermalState to
-        //     CRITICAL purely because of low battery, which would otherwise
-        //     mis-attribute "thermal critical" to a battery-induced pause. ---
-        if (thermalPaused) {
-            val battLow = batt > 0 && batt <= preferences.batteryCutoffPercent
-                && !preferences.externalPowerMode
-            val unplugged = !preferences.externalPowerMode && preferences.requireCharging
-                && !charging
+        // --- Pause-driven: the stats loop records why it paused. ---
+        pauseReason?.let { reason ->
             val thermalHigh = t > 0f && t >= preferences.pauseTempC
-            val msg = when {
-                battLow -> "PAUSED — battery $batt%"
-                unplugged -> "PAUSED — unplugged"
-                thermalHigh -> "PAUSED — thermal critical ($tStr)"
-                else -> "PAUSED — cooling ($tStr)"
+            val msg = when (reason) {
+                PauseReason.BATTERY -> "PAUSED — battery $batt%"
+                PauseReason.UNPLUGGED -> "PAUSED — unplugged"
+                PauseReason.HEAT ->
+                    if (thermalHigh) "PAUSED — thermal critical ($tStr)"
+                    else "PAUSED — cooling ($tStr)"
             }
             return ProtectionSeverity.CRITICAL to msg
         }
@@ -1044,14 +1090,14 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         // pause does land, the next poller tick already reads a cooler temp,
         // so the user only ever sees "PAUSED — cooling" and never the actual
         // "we just hit the limit" alert.
-        if (status?.thermalState == ThermalMonitor.ThermalState.CRITICAL) {
+        if (status?.heatState == ThermalMonitor.ThermalState.CRITICAL) {
             return ProtectionSeverity.CRITICAL to "Critical temp ($tStr) — pausing"
         }
-        if (miningEngine.isRunning && status?.thermalState == ThermalMonitor.ThermalState.THROTTLE) {
+        if (miningEngine.isRunning && status?.heatState == ThermalMonitor.ThermalState.THROTTLE) {
             val active = miningEngine.activeThreads
             return ProtectionSeverity.WARNING to "THROTTLED — $active threads ($tStr)"
         }
-        if (status?.thermalState == ThermalMonitor.ThermalState.WARNING) {
+        if (status?.heatState == ThermalMonitor.ThermalState.WARNING) {
             return ProtectionSeverity.WARNING to "Warm ($tStr) — monitoring"
         }
 

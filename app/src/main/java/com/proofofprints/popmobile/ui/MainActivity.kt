@@ -215,6 +215,7 @@ class MainActivity : ComponentActivity() {
         var difficulty by remember { mutableDoubleStateOf(0.0) }
         var protectionMessage by remember { mutableStateOf("") }
         var protectionSeverity by remember { mutableStateOf(MiningService.ProtectionSeverity.NONE) }
+        val miningPrefs = remember { com.proofofprints.popmobile.service.MiningPreferences(appContext) }
 
         // Update stats periodically
         LaunchedEffect(serviceBound.value) {
@@ -222,7 +223,7 @@ class MainActivity : ComponentActivity() {
                 miningService?.let {
                     hashrate = it.hashrate
                     totalHashes = it.totalHashes
-                    sharesFound = it.sharesFound
+                    sharesFound = it.sharesAccepted
                     sharesRejected = it.sharesRejected
                     isRunning = it.isRunning
                     poolConnected = it.isPoolConnected
@@ -258,6 +259,14 @@ class MainActivity : ComponentActivity() {
 
                 delay(1000)
             }
+        }
+
+        // System Back from Settings / Logs / About returns to the dashboard
+        // instead of closing the app.
+        androidx.activity.compose.BackHandler(enabled = showSettings || showLogs || showAbout) {
+            showSettings = false
+            showLogs = false
+            showAbout = false
         }
 
         // Render the update dialog over everything when an update is available.
@@ -485,10 +494,13 @@ class MainActivity : ComponentActivity() {
                         StatCardCompact(
                             label = "TEMP",
                             value = if (cpuTemp > 0) "${cpuTemp.toInt()}°C" else "--",
+                            // Same thresholds the protection logic acts on, so
+                            // the tile only turns amber/red when it matters.
                             color = when {
-                                cpuTemp >= 55 -> Color(0xFFFF4444)
-                                cpuTemp >= 50 -> Color(0xFFFF8C00)
-                                cpuTemp >= 45 -> Color(0xFFFBBF24)
+                                cpuTemp <= 0f -> Color(0xFF10B981)
+                                cpuTemp >= miningPrefs.pauseTempC -> Color(0xFFFF4444)
+                                cpuTemp >= miningPrefs.throttleTempC -> Color(0xFFFF8C00)
+                                cpuTemp >= miningPrefs.warnTempC -> Color(0xFFFBBF24)
                                 else -> Color(0xFF10B981)
                             },
                             modifier = Modifier.weight(1f)

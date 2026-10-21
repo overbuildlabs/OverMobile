@@ -43,6 +43,11 @@ class ThermalMonitor(
         val batteryPercent: Int,      // 0-100
         val isCharging: Boolean,
         val thermalState: ThermalState,
+        /** Heat-only severity: [thermalState] before low battery is folded
+         *  in. MiningService acts on this for pause/throttle/resume and
+         *  handles battery separately, so a battery pause isn't mistaken
+         *  for a thermal one (and vice versa). */
+        val heatState: ThermalState,
         val recommendedThreads: Int,  // Based on thermal state
         /** True when at least one usable thermal signal is available — either
          *  a sysfs zone read (cpuTemp > 0) or a PowerManager.getThermalHeadroom
@@ -109,10 +114,15 @@ class ThermalMonitor(
         // If the user has disabled thermal protection outright, never escalate
         // past NORMAL — the UI still shows the real temp (so they can monitor)
         // but MiningService won't act on it.
-        val thermalState = if (!prefs.thermalProtectionEnabled) {
+        val heatState = if (!prefs.thermalProtectionEnabled) {
             ThermalState.NORMAL
         } else {
-            computeThermalState(cpuTemp, batteryPercent, isCharging, headroom)
+            computeHeatState(cpuTemp, headroom)
+        }
+        val thermalState = if (!prefs.thermalProtectionEnabled || prefs.externalPowerMode) {
+            heatState
+        } else {
+            combineWithBattery(heatState, batteryPercent, isCharging)
         }
 
         val recommendedThreads = when (thermalState) {
@@ -127,12 +137,13 @@ class ThermalMonitor(
             batteryPercent = batteryPercent,
             isCharging = isCharging,
             thermalState = thermalState,
+            heatState = heatState,
             recommendedThreads = recommendedThreads,
             thermalSensorAvailable = thermalSensorAvailable
         )
     }
 
-    /** Combine four signals into a single thermal severity:
+    /** Combine three heat signals into a single severity:
      *
      *  1. User-configurable °C thresholds (pause/throttle/warn) against the
      *     sysfs CPU reading. The user's thresholds ALWAYS win when they
@@ -145,15 +156,13 @@ class ThermalMonitor(
      *     OEM-calibrated normalized [0, 1+] signal that works even when sysfs
      *     is SELinux-locked. The single highest-impact fallback for retail OEM
      *     ROMs that hide thermal_zone* from unprivileged apps.
-     *  4. Battery cutoff (low-battery as critical, also API-independent).
      *
-     *  We pick the maximum severity across (1)+(2)+(3); (4) is folded in
-     *  separately because it's about power, not heat. Battery is ignored
-     *  entirely in external-power mode. */
-    private fun computeThermalState(
+     *  We pick the maximum severity across the three. The battery cutoff is
+     *  folded in by getStatus() (for the displayed thermalState only)
+     *  because it's about power, not heat; it's ignored entirely in
+     *  external-power mode. */
+    private fun computeHeatState(
         displayTemp: Float,
-        batteryPercent: Int,
-        isCharging: Boolean,
         headroom: Float?
     ): ThermalState {
         val osState = readOsThermalState() ?: ThermalState.NORMAL
@@ -167,11 +176,8 @@ class ThermalMonitor(
 
         // ThermalState ordinal is severity — pick whichever source is most
         // conservative across all three thermal signals.
-        val tempState = listOf(thresholdState, osState, headroomState)
+        return listOf(thresholdState, osState, headroomState)
             .maxByOrNull { it.ordinal } ?: ThermalState.NORMAL
-
-        if (prefs.externalPowerMode) return tempState
-        return combineWithBattery(tempState, batteryPercent, isCharging)
     }
 
     /** Map a PowerManager.getThermalHeadroom value to our internal bucket.
