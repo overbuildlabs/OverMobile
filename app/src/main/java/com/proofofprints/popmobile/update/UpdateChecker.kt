@@ -32,7 +32,8 @@ data class UpdateInfo(
     val releaseNotes: String,     // markdown body from the release
     val apkUrl: String,           // browser_download_url of the .apk asset
     val apkSizeBytes: Long,       // size of the .apk asset (0 if unknown)
-    val apkAssetName: String      // e.g. "popmobile-v1.0.2.apk"
+    val apkAssetName: String,     // e.g. "popmobile-v1.0.2.apk" (sanitised)
+    val apkSha256: String? = null // from the asset's GitHub `digest`, if present
 )
 
 class UpdateChecker(context: Context) {
@@ -123,28 +124,50 @@ class UpdateChecker(context: Context) {
                 Log.w(TAG, "GitHub API returned $code")
                 return null
             }
-            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val body = conn.inputStream.bufferedReader().use { r ->
+                // The release JSON is a few KB; cap it so a broken or hostile
+                // response can't exhaust memory.
+                val buf = CharArray(1_000_000)
+                var n = 0
+                while (n < buf.size) {
+                    val k = r.read(buf, n, buf.size - n)
+                    if (k < 0) break
+                    n += k
+                }
+                if (n == buf.size && r.read() != -1) throw java.io.IOException("Release JSON too large")
+                String(buf, 0, n)
+            }
             val json = Gson().fromJson(body, JsonObject::class.java)
 
             val tagName = json["tag_name"]?.asString ?: return null
             val versionName = tagName.removePrefix("v").removePrefix("V")
-            val releaseName = json["name"]?.asString ?: tagName
-            val releaseNotes = json["body"]?.asString ?: ""
+            // GitHub sends "body": null for a release without notes; JsonNull
+            // .asString throws, which used to hide the update entirely.
+            val releaseName = json["name"]?.takeIf { !it.isJsonNull }?.asString ?: tagName
+            val releaseNotes = json["body"]?.takeIf { !it.isJsonNull }?.asString ?: ""
 
             // Pick the first .apk asset
             val assets = json.getAsJsonArray("assets") ?: return null
             for (i in 0 until assets.size()) {
                 val asset = assets[i].asJsonObject
-                val name = asset["name"]?.asString ?: continue
+                val name = asset["name"]?.takeIf { !it.isJsonNull }?.asString ?: continue
                 if (!name.endsWith(".apk")) continue
+                val apkUrl = asset["browser_download_url"]?.takeIf { !it.isJsonNull }?.asString ?: continue
+                if (!ApkVerifier.isAllowedDownloadUrl(apkUrl)) {
+                    Log.w(TAG, "Ignoring asset hosted outside our releases: $apkUrl")
+                    continue
+                }
                 return UpdateInfo(
                     tagName = tagName,
                     versionName = versionName,
                     releaseName = releaseName,
                     releaseNotes = releaseNotes,
-                    apkUrl = asset["browser_download_url"].asString,
-                    apkSizeBytes = asset["size"]?.asLong ?: 0L,
-                    apkAssetName = name
+                    apkUrl = apkUrl,
+                    apkSizeBytes = asset["size"]?.takeIf { !it.isJsonNull }?.asLong ?: 0L,
+                    apkAssetName = ApkVerifier.safeFileName(name),
+                    apkSha256 = ApkVerifier.parseGithubDigest(
+                        asset["digest"]?.takeIf { !it.isJsonNull }?.asString
+                    )
                 )
             }
             Log.w(TAG, "Release $tagName has no .apk asset")

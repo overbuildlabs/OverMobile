@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar / notification small icon: single-colour silhouette of the
+     OverMobile mark (hex ring, phone outline, cube). Android tints small
+     icons, so only the alpha channel matters. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="256"
+    android:viewportHeight="256">
+    <path android:fillColor="#FFFFFFFF" android:fillType="evenOdd"
+        android:pathData="M128,10 L230.19,69 L230.19,187 L128,246 L25.81,187 L25.81,69 Z M128,36 L48.33,82 L48.33,174 L128,220 L207.67,174 L207.67,82 Z"/>
+    <path android:strokeColor="#FFFFFFFF" android:strokeWidth="16"
+        android:pathData="M107,62 H149 A13,13 0 0 1 162,75 V175 A13,13 0 0 1 149,188 H107 A13,13 0 0 1 94,175 V75 A13,13 0 0 1 107,62 Z"/>
+    <path android:fillColor="#FFFFFFFF"
+        android:pathData="M128,98 L150,111 L150,137 L128,150 L106,137 L106,111 Z"/>
+</vector>

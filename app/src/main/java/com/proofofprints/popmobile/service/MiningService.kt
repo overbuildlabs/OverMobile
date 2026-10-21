@@ -18,9 +18,11 @@ import android.net.wifi.WifiManager
 import android.os.PowerManager
 import android.util.Log
 import com.proofofprints.popmobile.LogManager
+import com.proofofprints.popmobile.R
 import com.proofofprints.popmobile.mining.MiningEngine
 import com.proofofprints.popmobile.popmanager.PoPManagerReporter
 import com.proofofprints.popmobile.stratum.StratumClient
+import com.proofofprints.popmobile.ui.FieldValidators
 import com.proofofprints.popmobile.ui.MainActivity
 import kotlinx.coroutines.*
 
@@ -34,6 +36,9 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         const val ACTION_START = "com.proofofprints.popmobile.START"
         const val ACTION_STOP = "com.proofofprints.popmobile.STOP"
         const val ACTION_ENSURE_RUNNING = "com.proofofprints.popmobile.ENSURE_RUNNING"
+
+        /** Wake-lock timeout; statsUpdateLoop re-acquires at half of it. */
+        private const val WAKE_LOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L
     }
 
     inner class MiningBinder : Binder() {
@@ -48,6 +53,9 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         private set
     private var miningStartedAt: Long = 0L
     private var wakeLock: PowerManager.WakeLock? = null
+    private var wakeLockAcquiredAt = 0L
+    private var statsJob: Job? = null
+    private var reconnectJob: Job? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private lateinit var thermalMonitor: ThermalMonitor
 
@@ -306,8 +314,20 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         var changedPool = false
         var changedThreads = false
 
-        params.get("poolUrl")?.takeIf { !it.isJsonNull }?.asString?.let { url ->
-            val cleaned = url.replace("stratum+tcp://", "")
+        // Validate every field before changing anything: these values arrive
+        // over the network from OverManager, so apply the same checks the
+        // Settings screen does (and refuse a half-applied config).
+        val newPoolUrl = params.get("poolUrl")?.takeIf { !it.isJsonNull }?.asString?.trim()
+        val newWallet = params.get("wallet")?.takeIf { !it.isJsonNull }?.asString?.trim()
+        val newWorker = params.get("worker")?.takeIf { !it.isJsonNull }?.asString?.trim()
+        newPoolUrl?.let { FieldValidators.validatePoolUrl(it)?.let { e -> return "invalid poolUrl: $e" } }
+        newWallet?.let { FieldValidators.validateWalletAddress(it)?.let { e -> return "invalid wallet: $e" } }
+        newWorker?.let { FieldValidators.validateWorkerName(it)?.let { e -> return "invalid worker: $e" } }
+        val newThreads = params.get("threads")?.takeIf { !it.isJsonNull }?.asInt
+        if (newThreads != null && newThreads !in 1..16) return "threads out of range: $newThreads"
+
+        newPoolUrl?.let { url ->
+            val cleaned = url.replace("stratum+tcp://", "").trimEnd('/')
             val parts = cleaned.split(":")
             if (parts.size != 2) return "invalid poolUrl: $url"
             val newHost = parts[0]
@@ -319,22 +339,24 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
             }
             prefs.putString("pool_url", url)
         }
-        params.get("wallet")?.takeIf { !it.isJsonNull }?.asString?.let { wallet ->
+        newWallet?.let { wallet ->
             if (wallet != walletAddress) {
+                // Payout address changed remotely — make it visible on the
+                // device, not only in logcat.
+                LogManager.warn("OverManager changed the payout wallet to ${wallet.take(14)}…${wallet.takeLast(6)}")
                 walletAddress = wallet
                 changedPool = true
             }
             prefs.putString("wallet", wallet)
         }
-        params.get("worker")?.takeIf { !it.isJsonNull }?.asString?.let { w ->
+        newWorker?.let { w ->
             if (w != workerName) {
                 workerName = w
                 changedPool = true
             }
             prefs.putString("worker", w)
         }
-        params.get("threads")?.takeIf { !it.isJsonNull }?.asInt?.let { t ->
-            if (t < 1 || t > 16) return "threads out of range: $t"
+        newThreads?.let { t ->
             if (t != threadCount) {
                 threadCount = t
                 changedThreads = true
@@ -348,7 +370,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
 
         // If currently mining and the pool-side config changed, restart the
         // stratum connection + worker threads to pick up the new values.
-        if (miningEngine.isRunning && changedPool) {
+        if (isSessionActive && changedPool) {
             Log.i(TAG, "set_config: restarting mining to apply new pool/wallet/worker")
             restartMiningInternal()
         } else if (miningEngine.isRunning && changedThreads) {
@@ -382,7 +404,9 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
     }
 
     private fun handleRemoteStart(): String? {
-        if (miningEngine.isRunning) return null  // already running = success
+        // A session that is connecting, waiting for a job or thermally paused
+        // is already "started" even though the engine isn't running.
+        if (isSessionActive) return null
         if (poolHost.isEmpty() || walletAddress.isEmpty()) {
             return "cannot start: pool or wallet not configured"
         }
@@ -392,7 +416,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
     }
 
     private fun handleRemoteStop(): String? {
-        if (!miningEngine.isRunning) return null  // already stopped = success
+        if (!isSessionActive) return null  // already stopped = success
         Log.i(TAG, "Remote stop command")
         stopMining()  // keeps the reporter alive since serverUrl is set
         return null
@@ -407,8 +431,13 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
     private fun restartMiningInternal() {
         serviceScope.launch {
             try {
-                miningEngine.stop()
                 stratumClient.disconnect()
+                miningEngine.stop()
+                // disconnect() is intentional, so onDisconnected doesn't run;
+                // reset here so onNewJob starts the engine on the new pool.
+                engineStartedOnce = false
+                activeThreads = 0
+                poolState = PoolState.CONNECTING
                 stratumClient.connect(poolHost, poolPort, walletAddress, workerName)
                 // Mining engine will be restarted by the stratum job handler
             } catch (e: Exception) {
@@ -446,8 +475,10 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
 
     override fun onDestroy() {
         Log.i(TAG, "Service onDestroy — tearing down reporter and mining")
-        miningEngine.stop()
         stratumClient.disconnect()
+        miningEngine.stop()
+        // Drops the native global ref to this Service so it can be collected.
+        miningEngine.setShareCallback(null)
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         wifiLock?.let { if (it.isHeld) it.release() }
@@ -458,6 +489,25 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
     }
 
     fun startMining() {
+        // A second Start (double tap, or a remote start while connecting /
+        // paused) would open a second pool connection, a second stats loop
+        // fighting over throttling, and leak the first wake lock.
+        if (isSessionActive) {
+            Log.i(TAG, "startMining: session already active")
+            return
+        }
+        // Become foreground first. From the background on Android 12+ this
+        // throws; in that case leave nothing half-started.
+        try {
+            startForeground(NOTIFICATION_ID, createNotification("Connecting to pool..."))
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground failed: ${e.message}")
+            LogManager.warn("Couldn't start mining in the background — open OverMobile and press Start")
+            poolState = PoolState.ERROR
+            poolErrorReason = "Open the app to start"
+            return
+        }
+
         Log.i(TAG, "Starting mining service...")
         LogManager.info("Mining service starting ($threadCount threads)")
         isStopping = false
@@ -465,14 +515,21 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         poolState = PoolState.CONNECTING
         poolErrorReason = null
         miningStartedAt = System.currentTimeMillis()
+        miningEngine.resetStats()
         // Reporter is already running from onCreate — just fire an immediate
         // status update so OverManager sees the transition quickly.
         popManagerReporter.reportNow()
 
-        // Acquire wake lock to prevent CPU sleep
+        releaseLocks()
+        // Acquire wake lock to prevent CPU sleep. Not reference counted, so
+        // statsUpdateLoop can re-acquire it to extend the timeout for
+        // sessions longer than WAKE_LOCK_TIMEOUT_MS.
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KASMiner::MiningLock")
-        wakeLock?.acquire(4 * 60 * 60 * 1000L) // 4 hour max
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KASMiner::MiningLock").apply {
+            setReferenceCounted(false)
+            acquire(WAKE_LOCK_TIMEOUT_MS)
+        }
+        wakeLockAcquiredAt = System.currentTimeMillis()
 
         // Acquire WiFi lock to prevent WiFi from being disabled during mining
         @Suppress("DEPRECATION")
@@ -481,16 +538,14 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "KASMiner:WifiLock")
         wifiLock?.acquire()
 
-        // Start foreground notification
-        startForeground(NOTIFICATION_ID, createNotification("Connecting to pool..."))
-
         // Connect to pool then start mining
-        serviceScope.launch {
+        statsJob?.cancel()
+        statsJob = serviceScope.launch {
             try {
-                stratumClient.connect(poolHost, poolPort, walletAddress, workerName)
-
-                // Start hashrate update loop
+                // Start the stats loop first: it owns throttling and must run
+                // even if the first connect fails and the retry loop takes over.
                 launch { statsUpdateLoop() }
+                stratumClient.connect(poolHost, poolPort, walletAddress, workerName)
             } catch (e: Exception) {
                 val reason = friendlyConnectError(e)
                 Log.e(TAG, "Failed to start mining: $reason")
@@ -517,6 +572,13 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         }
     }
 
+    private fun releaseLocks() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
+        wifiLock?.let { if (it.isHeld) it.release() }
+        wifiLock = null
+    }
+
     fun stopMining() {
         Log.i(TAG, "Stopping mining...")
         isStopping = true
@@ -530,16 +592,16 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         coolingSince = 0L
         activeThreads = 0
         engineStartedOnce = false
-        miningEngine.stop()
+        statsJob?.cancel()
+        statsJob = null
+        reconnectJob?.cancel()
+        reconnectJob = null
+        // Close the socket before joining the workers: a worker blocked
+        // writing a share to a dead connection would otherwise hang the join
+        // (and the main thread with it).
         stratumClient.disconnect()
-        wakeLock?.let {
-            if (it.isHeld) it.release()
-        }
-        wakeLock = null
-        wifiLock?.let {
-            if (it.isHeld) it.release()
-        }
-        wifiLock = null
+        miningEngine.stop()
+        releaseLocks()
 
         // Keep the service alive so the OverManager reporter keeps running
         // and can receive remote commands. Update the foreground notification
@@ -589,6 +651,13 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         // hashrate diagnostic.
         while (isSessionActive) {
             tickCount++
+
+            // Extend the wake lock before its timeout lapses on long sessions.
+            val now = System.currentTimeMillis()
+            if (now - wakeLockAcquiredAt > WAKE_LOCK_TIMEOUT_MS / 2) {
+                wakeLock?.acquire(WAKE_LOCK_TIMEOUT_MS)
+                wakeLockAcquiredAt = now
+            }
 
             // Periodic hashrate diagnostic — every 20 ticks (~60s) log the
             // three windowed rates plus per-thread deltas. Lets us see in
@@ -668,7 +737,10 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                 }
                 ThermalMonitor.ThermalState.NORMAL -> {
                     val nowMs = System.currentTimeMillis()
-                    val coolEnough = cpuTemp > 0f && cpuTemp <= preferences.resumeTempC
+                    // Devices with no readable sysfs zone (cpuTemp == 0) rely on
+                    // the OS thermal signal; NORMAL from it is cool enough.
+                    // Requiring cpuTemp > 0 left them paused forever.
+                    val coolEnough = cpuTemp <= 0f || cpuTemp <= preferences.resumeTempC
 
                     if (thermalPaused && !miningEngine.isRunning) {
                         if (coolEnough) {
@@ -770,7 +842,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         // session is alive. Previously capped at 10 attempts (~7 min) which
         // meant a bridge that came back 10 minutes later would never be
         // picked up — the user had to manually Stop/Start to recover.
-        serviceScope.launch {
+        reconnectJob = serviceScope.launch {
             try {
                 var delayMs = 5_000L
                 val maxDelayMs = 60_000L
@@ -858,7 +930,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
 
     override fun onExtranonceSet(extranonce: String, extranonceShifted: Long, extranonce2Bits: Int) {
         Log.i(TAG, "Extranonce set: $extranonce (prefix=0x${String.format("%016x", extranonceShifted)}, en2bits=$extranonce2Bits)")
-        LogManager.info("Extranonce: $extranonce")
+        if (extranonce.isNotEmpty()) LogManager.info("Extranonce: $extranonce")
         miningEngine.setExtranonce(extranonceShifted, extranonce2Bits)
     }
 
@@ -868,7 +940,13 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         val nonceHex = String.format("%016x", nonce)
         Log.i(TAG, "Share found! Job: $jobId, Nonce: $nonce")
         LogManager.info("Share found! Nonce: $nonceHex Job: $jobId")
-        stratumClient.submitShare(jobId, nonce)
+        // Called on a native hashing thread: hand the network write to IO so
+        // a slow or dead socket never stalls hashing (or a stop()'s join).
+        serviceScope.launch(Dispatchers.IO) {
+            try { stratumClient.submitShare(jobId, nonce) } catch (e: Exception) {
+                Log.e(TAG, "submitShare failed: ${e.message}")
+            }
+        }
     }
 
     // ===== Notification management =====
@@ -904,7 +982,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("OverMobile")
             .setContentText(status)
-            .setSmallIcon(android.R.drawable.ic_menu_manage)
+            .setSmallIcon(R.drawable.ic_stat_overmobile)
             .setContentIntent(pendingIntent)
             .addAction(Notification.Action.Builder(
                 null, "Stop Mining", stopIntent

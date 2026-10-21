@@ -9,8 +9,8 @@ body:
         Thanks for taking the time to file a bug report. The more detail you provide, the faster we can reproduce and fix the issue.
 
         **Before filing**, please confirm:
-        - You're running the [latest release](https://github.com/proofofprints/PoPMobile/releases) (check Settings → About)
-        - You've searched [existing issues](https://github.com/proofofprints/PoPMobile/issues?q=is%3Aissue) and this isn't a duplicate
+        - You're running the [latest release](https://github.com/overbuildlabs/overmobile/releases) (check Settings → About)
+        - You've searched [existing issues](https://github.com/overbuildlabs/overmobile/issues?q=is%3Aissue) and this isn't a duplicate
 
   - type: input
     id: app-version

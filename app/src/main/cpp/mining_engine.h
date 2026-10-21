@@ -84,6 +84,9 @@ typedef void (*share_found_callback)(const char *job_id, uint64_t nonce);
  */
 uint32_t mining_get_shares_rejected(void);
 void mining_increment_rejected(void);
+
+/** Zero the accepted/rejected share counters (start of a user session). */
+void mining_reset_stats(void);
 void mining_set_share_callback(share_found_callback cb);
 
 /**

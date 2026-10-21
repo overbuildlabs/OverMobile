@@ -1,4 +1,4 @@
-# Cutting a OverMobile release
+# Cutting an OverMobile release
 
 Checklist to produce a signed APK, compute its checksum, and publish a GitHub release. Paste-ready commands are Windows cmd (the project's primary build environment); macOS/Linux equivalents are shown where they differ.
 
@@ -78,7 +78,7 @@ It should print one line: `<hash> *popmobile-vX.Y.Z.apk`.
 
 ## 6. Publish the GitHub release
 
-1. Open https://github.com/proofofprints/PoPMobile/releases/new
+1. Open https://github.com/overbuildlabs/overmobile/releases/new
 2. **Choose a tag** → type `vX.Y.Z` → "Create new tag: vX.Y.Z on publish"
 3. **Target** → `main`
 4. **Release title** → `vX.Y.Z`

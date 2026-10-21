@@ -31,6 +31,7 @@ class InstallReceiver : BroadcastReceiver() {
         val prefs = context.applicationContext
             .getSharedPreferences(PrefsKeys.PREFS, Context.MODE_PRIVATE)
         val pendingId = prefs.getLong(PrefsKeys.PENDING_ID, -1L)
+        val expectedSha256 = prefs.getString(PrefsKeys.PENDING_SHA256, null)
         if (pendingId == -1L || pendingId != broadcastId) {
             Log.i(TAG, "Ignoring download $broadcastId (pending=$pendingId)")
             return
@@ -59,6 +60,12 @@ class InstallReceiver : BroadcastReceiver() {
                 Log.w(TAG, "Downloaded file missing: $file")
                 return
             }
+            val problem = ApkVerifier.verify(context.applicationContext, file, expectedSha256)
+            if (problem != null) {
+                Log.w(TAG, "Refusing to install $file: $problem")
+                file.delete()
+                return
+            }
             launchInstall(context.applicationContext, file)
         }
     }
@@ -83,4 +90,6 @@ class InstallReceiver : BroadcastReceiver() {
 internal object PrefsKeys {
     const val PREFS = "update_checker"
     const val PENDING_ID = "pending_download_id"
+    /** Expected SHA-256 of the pending download (null if GitHub gave none). */
+    const val PENDING_SHA256 = "pending_download_sha256"
 }

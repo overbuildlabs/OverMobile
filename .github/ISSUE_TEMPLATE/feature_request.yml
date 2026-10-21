@@ -8,7 +8,7 @@ body:
       value: |
         Thanks for the idea. Concrete use cases help us prioritise — tell us what problem you're trying to solve, not just what you'd like to see.
 
-        **Before filing**, please [search existing issues](https://github.com/proofofprints/PoPMobile/issues?q=is%3Aissue) to see if someone has already suggested something similar.
+        **Before filing**, please [search existing issues](https://github.com/overbuildlabs/overmobile/issues?q=is%3Aissue) to see if someone has already suggested something similar.
 
   - type: textarea
     id: problem

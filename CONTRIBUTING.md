@@ -21,8 +21,8 @@ Thanks for your interest in improving OverMobile. Contributions — code, bug re
 **Build and run:**
 
 ```bash
-git clone https://github.com/proofofprints/PoPMobile.git
-cd OverMobile
+git clone https://github.com/overbuildlabs/overmobile.git
+cd overmobile
 ./gradlew assembleDebug          # CLI build
 # or open the folder in Android Studio and hit Run
 ```
@@ -93,7 +93,7 @@ By submitting a PR you agree that your contribution is licensed under the same [
 
 ## Questions
 
-- **Bugs / feature discussion**: [GitHub Issues](https://github.com/proofofprints/PoPMobile/issues)
-- **General questions**: [support@proofofprints.com](mailto:support@proofofprints.com)
+- **Bugs / feature discussion**: [GitHub Issues](https://github.com/overbuildlabs/overmobile/issues)
+- **General questions**: [support@overbuildlabs.com](mailto:support@overbuildlabs.com)
 
 Thanks for contributing.

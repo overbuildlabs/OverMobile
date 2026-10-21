@@ -6,6 +6,7 @@
 
 #include <jni.h>
 #include <android/log.h>
+#include <pthread.h>
 #include <string.h>
 
 extern "C" {
@@ -20,6 +21,9 @@ extern "C" {
 static JavaVM *g_jvm = nullptr;
 static jobject g_callback_obj = nullptr;
 static jmethodID g_on_share_found_method = nullptr;
+/* Worker threads read the callback under the read lock; swapping it takes the
+ * write lock, so a global ref is never deleted while a worker is using it. */
+static pthread_rwlock_t g_callback_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* Called when the native library is loaded */
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
@@ -29,25 +33,44 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
 
 /* Share found callback — bridges from C to Java */
 static void native_share_callback(const char *job_id, uint64_t nonce) {
-    if (!g_jvm || !g_callback_obj) return;
+    if (!g_jvm) return;
 
-    JNIEnv *env;
+    pthread_rwlock_rdlock(&g_callback_lock);
+    if (!g_callback_obj || !g_on_share_found_method) {
+        pthread_rwlock_unlock(&g_callback_lock);
+        return;
+    }
+
+    JNIEnv *env = nullptr;
     bool needs_detach = false;
 
     if (g_jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
-        g_jvm->AttachCurrentThread(&env, nullptr);
-        needs_detach = true;
+        if (g_jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            env = nullptr;
+        } else {
+            needs_detach = true;
+        }
     }
 
-    if (env && g_on_share_found_method) {
+    if (env) {
         jstring jJobId = env->NewStringUTF(job_id);
-        env->CallVoidMethod(g_callback_obj, g_on_share_found_method, jJobId, (jlong)nonce);
-        env->DeleteLocalRef(jJobId);
+        if (jJobId) {
+            env->CallVoidMethod(g_callback_obj, g_on_share_found_method, jJobId, (jlong)nonce);
+            env->DeleteLocalRef(jJobId);
+        }
+        /* A Kotlin exception left pending here would be raised as uncaught
+         * when the thread detaches, killing the process. Log and drop it:
+         * losing one share is better than crashing the miner. */
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
     }
 
     if (needs_detach) {
         g_jvm->DetachCurrentThread();
     }
+    pthread_rwlock_unlock(&g_callback_lock);
 }
 
 /* ===== JNI Methods ===== */
@@ -76,15 +99,28 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_proofofprints_popmobile_mining_MiningEngine_nativeSetJob(
         JNIEnv *env, jobject thiz, jbyteArray headerHash, jstring jobId, jbyteArray target, jlong timestamp) {
 
-    jbyte *header = env->GetByteArrayElements(headerHash, nullptr);
-    jbyte *tgt = env->GetByteArrayElements(target, nullptr);
+    /* mining_set_job copies exactly 32 bytes from each array. */
+    if (!headerHash || !target || !jobId ||
+        env->GetArrayLength(headerHash) < 32 || env->GetArrayLength(target) < 32) {
+        LOGI("nativeSetJob: ignoring malformed job");
+        return;
+    }
+    uint8_t header[32];
+    uint8_t tgt[32];
+    env->GetByteArrayRegion(headerHash, 0, 32, (jbyte *)header);
+    env->GetByteArrayRegion(target, 0, 32, (jbyte *)tgt);
     const char *jid = env->GetStringUTFChars(jobId, nullptr);
+    if (!jid) return;  /* OOM; exception pending for the caller */
 
-    mining_set_job((const uint8_t *)header, jid, (const uint8_t *)tgt, (uint64_t)timestamp);
+    mining_set_job(header, jid, tgt, (uint64_t)timestamp);
 
-    env->ReleaseByteArrayElements(headerHash, header, JNI_ABORT);
-    env->ReleaseByteArrayElements(target, tgt, JNI_ABORT);
     env->ReleaseStringUTFChars(jobId, jid);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_proofofprints_popmobile_mining_MiningEngine_nativeResetStats(
+        JNIEnv *env, jobject thiz) {
+    mining_reset_stats();
 }
 
 extern "C" JNIEXPORT jdouble JNICALL
@@ -127,20 +163,29 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_proofofprints_popmobile_mining_MiningEngine_nativeSetShareCallback(
         JNIEnv *env, jobject thiz, jobject callback) {
 
+    pthread_rwlock_wrlock(&g_callback_lock);
+
     /* Clean up previous global ref */
     if (g_callback_obj) {
         env->DeleteGlobalRef(g_callback_obj);
         g_callback_obj = nullptr;
     }
+    g_on_share_found_method = nullptr;
 
     if (callback) {
-        g_callback_obj = env->NewGlobalRef(callback);
         jclass cls = env->GetObjectClass(callback);
-        g_on_share_found_method = env->GetMethodID(cls, "onShareFound", "(Ljava/lang/String;J)V");
-        mining_set_share_callback(native_share_callback);
-    } else {
-        mining_set_share_callback(nullptr);
+        jmethodID mid = env->GetMethodID(cls, "onShareFound", "(Ljava/lang/String;J)V");
+        env->DeleteLocalRef(cls);
+        if (mid) {
+            g_callback_obj = env->NewGlobalRef(callback);
+            g_on_share_found_method = mid;
+        } else {
+            env->ExceptionClear();  /* NoSuchMethodError */
+        }
     }
+    mining_set_share_callback(g_callback_obj ? native_share_callback : nullptr);
+
+    pthread_rwlock_unlock(&g_callback_lock);
 }
 
 extern "C" JNIEXPORT jint JNICALL
