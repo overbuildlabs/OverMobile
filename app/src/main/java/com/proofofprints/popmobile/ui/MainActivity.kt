@@ -171,16 +171,23 @@ class MainActivity : ComponentActivity() {
         var popDeviceName by remember {
             mutableStateOf(popPrefs.getString("device_name", defaultDeviceName) ?: defaultDeviceName)
         }
+        // Protection (thermal + power) options, staged like the fields above
+        // and only written to MiningPreferences on Save.
+        val miningPrefs = remember { MiningPreferences(applicationContext) }
+        var protection by remember { mutableStateOf(ProtectionSettings.load(miningPrefs)) }
 
         // Last-saved values of every field Save persists. The Settings screen
         // is "dirty" whenever the live fields differ from this snapshot.
         var savedSettings by remember {
-            mutableStateOf(SavedSettings(poolUrl, wallet, worker, threads, popServerUrl, popDeviceName))
+            mutableStateOf(
+                SavedSettings(poolUrl, wallet, worker, threads, popServerUrl, popDeviceName, protection)
+            )
         }
         // Read state at call time (not a composition-time val) so callbacks
         // never act on a stale answer.
         fun isSettingsDirty() = showSettings &&
-            SavedSettings(poolUrl, wallet, worker, threads, popServerUrl, popDeviceName) != savedSettings
+            SavedSettings(poolUrl, wallet, worker, threads, popServerUrl, popDeviceName, protection) !=
+                savedSettings
         val settingsDirty = isSettingsDirty()
         var showSaved by remember { mutableStateOf(false) }
         // Navigation the user attempted while Settings had unsaved changes;
@@ -194,6 +201,7 @@ class MainActivity : ComponentActivity() {
             threads = savedSettings.threads
             popServerUrl = savedSettings.popServerUrl
             popDeviceName = savedSettings.popDeviceName
+            protection = savedSettings.protection
         }
 
         // Single save path for the Save bar and the unsaved-changes dialog.
@@ -228,6 +236,9 @@ class MainActivity : ComponentActivity() {
                 .putString("server_url", popServerUrl)
                 .putString("device_name", popDeviceName)
                 .apply()
+            // The service and ThermalMonitor read MiningPreferences on every
+            // tick, so new limits take effect without a restart.
+            protection.saveTo(miningPrefs)
             // Restart reporter so it picks up the new server URL /
             // device name. If the URL now names a different server,
             // the reporter drops the old server's credentials and asks
@@ -244,7 +255,9 @@ class MainActivity : ComponentActivity() {
                 }
                 ContextCompat.startForegroundService(this@MainActivity, intent)
             }
-            savedSettings = SavedSettings(poolUrl, wallet, worker, threads, popServerUrl, popDeviceName)
+            savedSettings = SavedSettings(
+                poolUrl, wallet, worker, threads, popServerUrl, popDeviceName, protection
+            )
             showSaved = true
             return true
         }
@@ -253,12 +266,6 @@ class MainActivity : ComponentActivity() {
         // edits are never silently dropped (or silently kept, half-applied).
         fun navigate(action: () -> Unit) {
             if (isSettingsDirty()) pendingNavigation = action else action()
-        }
-
-        // System back from Settings returns to the Dashboard (prompting first
-        // if there are unsaved changes) instead of leaving the app.
-        androidx.activity.compose.BackHandler(enabled = showSettings) {
-            navigate { showSettings = false }
         }
 
         pendingNavigation?.let { proceed ->
@@ -348,7 +355,6 @@ class MainActivity : ComponentActivity() {
         var difficulty by remember { mutableDoubleStateOf(0.0) }
         var protectionMessage by remember { mutableStateOf("") }
         var protectionSeverity by remember { mutableStateOf(MiningService.ProtectionSeverity.NONE) }
-        val miningPrefs = remember { com.proofofprints.popmobile.service.MiningPreferences(appContext) }
 
         // Update stats periodically
         LaunchedEffect(serviceBound.value) {
@@ -393,10 +399,11 @@ class MainActivity : ComponentActivity() {
                     popServerUrl = popPrefs.getString("server_url", "") ?: ""
                     popDeviceName = popPrefs.getString("device_name", defaultDeviceName)
                         ?: defaultDeviceName
+                    protection = ProtectionSettings.load(miningPrefs)
                     // Outside Settings the fields mirror prefs, so they are
                     // by definition the last-saved values.
                     savedSettings = SavedSettings(
-                        poolUrl, wallet, worker, threads, popServerUrl, popDeviceName
+                        poolUrl, wallet, worker, threads, popServerUrl, popDeviceName, protection
                     )
                 }
 
@@ -405,11 +412,15 @@ class MainActivity : ComponentActivity() {
         }
 
         // System Back from Settings / Logs / About returns to the dashboard
-        // instead of closing the app.
+        // instead of closing the app, prompting first if Settings has unsaved
+        // edits. One handler only: with two, the later-registered one wins
+        // and Back skipped the prompt.
         androidx.activity.compose.BackHandler(enabled = showSettings || showLogs || showAbout) {
-            showSettings = false
-            showLogs = false
-            showAbout = false
+            navigate {
+                showSettings = false
+                showLogs = false
+                showAbout = false
+            }
         }
 
         // Render the update dialog over everything when an update is available.
@@ -558,6 +569,8 @@ class MainActivity : ComponentActivity() {
                                 popDeviceName = popDeviceName,
                                 onPopServerUrlChange = { popServerUrl = it },
                                 onPopDeviceNameChange = { popDeviceName = it },
+                                protection = protection,
+                                onProtectionChange = { protection = it },
                                 onPopSettingsPersisted = {
                                     // Pairing writes server URL + device name on
                                     // its own; those values are now the saved ones.
@@ -982,6 +995,8 @@ class MainActivity : ComponentActivity() {
         popDeviceName: String,
         onPopServerUrlChange: (String) -> Unit,
         onPopDeviceNameChange: (String) -> Unit,
+        protection: ProtectionSettings,
+        onProtectionChange: (ProtectionSettings) -> Unit,
         onPopSettingsPersisted: () -> Unit
     ) {
         // The native engine runs at most 8 workers (MAX_THREADS in
@@ -1113,7 +1128,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // ========= PROTECTION (thermal + power) =========
-            ProtectionSettingsCard()
+            ProtectionSettingsCard(protection, onProtectionChange)
 
             // ========= THERMAL DIAGNOSTICS =========
             ThermalDiagnosticsCard()
@@ -1361,8 +1376,46 @@ class MainActivity : ComponentActivity() {
         val worker: String,
         val threads: Int,
         val popServerUrl: String,
-        val popDeviceName: String
+        val popDeviceName: String,
+        val protection: ProtectionSettings
     )
+
+    /** Staged copy of the [MiningPreferences] protection knobs. Edited on
+     *  the Settings screen and written back only by Save. */
+    data class ProtectionSettings(
+        val thermalEnabled: Boolean,
+        val warnTemp: Float,
+        val throttleTemp: Float,
+        val pauseTemp: Float,
+        val resumeTemp: Float,
+        val externalPower: Boolean,
+        val requireCharging: Boolean,
+        val batteryCutoff: Int
+    ) {
+        fun saveTo(prefs: MiningPreferences) {
+            prefs.thermalProtectionEnabled = thermalEnabled
+            prefs.warnTempC = warnTemp
+            prefs.throttleTempC = throttleTemp
+            prefs.pauseTempC = pauseTemp
+            prefs.resumeTempC = resumeTemp
+            prefs.externalPowerMode = externalPower
+            prefs.requireCharging = requireCharging
+            prefs.batteryCutoffPercent = batteryCutoff
+        }
+
+        companion object {
+            fun load(prefs: MiningPreferences) = ProtectionSettings(
+                thermalEnabled = prefs.thermalProtectionEnabled,
+                warnTemp = prefs.warnTempC,
+                throttleTemp = prefs.throttleTempC,
+                pauseTemp = prefs.pauseTempC,
+                resumeTemp = prefs.resumeTempC,
+                externalPower = prefs.externalPowerMode,
+                requireCharging = prefs.requireCharging,
+                batteryCutoff = prefs.batteryCutoffPercent
+            )
+        }
+    }
 
     /** Save / Cancel bar pinned above the scrolling Settings content. Both
      *  buttons are disabled until something differs from the saved values. */
@@ -1432,22 +1485,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Thermal + power management settings. All knobs read from and write
-     *  through [MiningPreferences] so the running MiningService picks them
-     *  up on its next 3-second tick without needing a restart. */
+    /** Thermal + power management settings. Edits are staged in [value]
+     *  (hoisted into MinerDashboard) and written to [MiningPreferences] by
+     *  the Settings Save bar; the running MiningService picks them up on its
+     *  next 3-second tick without needing a restart. */
     @Composable
-    fun ProtectionSettingsCard() {
-        val prefs = remember { MiningPreferences(applicationContext) }
-
-        var thermalEnabled by remember { mutableStateOf(prefs.thermalProtectionEnabled) }
-        var warnTemp by remember { mutableStateOf(prefs.warnTempC) }
-        var throttleTemp by remember { mutableStateOf(prefs.throttleTempC) }
-        var pauseTemp by remember { mutableStateOf(prefs.pauseTempC) }
-        var resumeTemp by remember { mutableStateOf(prefs.resumeTempC) }
-
-        var externalPower by remember { mutableStateOf(prefs.externalPowerMode) }
-        var requireCharging by remember { mutableStateOf(prefs.requireCharging) }
-        var batteryCutoff by remember { mutableStateOf(prefs.batteryCutoffPercent) }
+    fun ProtectionSettingsCard(
+        value: ProtectionSettings,
+        onChange: (ProtectionSettings) -> Unit
+    ) {
+        val thermalEnabled = value.thermalEnabled
+        val warnTemp = value.warnTemp
+        val throttleTemp = value.throttleTemp
+        val pauseTemp = value.pauseTemp
+        val resumeTemp = value.resumeTemp
+        val externalPower = value.externalPower
+        val requireCharging = value.requireCharging
+        val batteryCutoff = value.batteryCutoff
 
         var showDisableDialog by remember { mutableStateOf(false) }
         var showExtPowerDialog by remember { mutableStateOf(false) }
@@ -1501,8 +1555,7 @@ class MainActivity : ComponentActivity() {
                             if (!newValue) {
                                 showDisableDialog = true
                             } else {
-                                thermalEnabled = true
-                                prefs.thermalProtectionEnabled = true
+                                onChange(value.copy(thermalEnabled = true))
                             }
                         },
                         colors = SwitchDefaults.colors(
@@ -1518,8 +1571,7 @@ class MainActivity : ComponentActivity() {
                         value = warnTemp,
                         color = Color(0xFFFBBF24),
                         onValueChange = {
-                            warnTemp = it
-                            prefs.warnTempC = it
+                            onChange(value.copy(warnTemp = it))
                         }
                     )
                     TempSlider(
@@ -1527,8 +1579,7 @@ class MainActivity : ComponentActivity() {
                         value = throttleTemp,
                         color = Color(0xFFFFA500),
                         onValueChange = {
-                            throttleTemp = it
-                            prefs.throttleTempC = it
+                            onChange(value.copy(throttleTemp = it))
                         }
                     )
                     TempSlider(
@@ -1536,16 +1587,15 @@ class MainActivity : ComponentActivity() {
                         value = pauseTemp,
                         color = warningColor,
                         onValueChange = { newPause ->
-                            pauseTemp = newPause
-                            prefs.pauseTempC = newPause
                             // Resume must always sit strictly below Pause —
                             // otherwise we'd thrash on every tick. Pull it
                             // down with the Pause slider when needed.
-                            val cap = newPause - 1f
-                            if (resumeTemp > cap) {
-                                resumeTemp = cap
-                                prefs.resumeTempC = cap
-                            }
+                            onChange(
+                                value.copy(
+                                    pauseTemp = newPause,
+                                    resumeTemp = minOf(resumeTemp, newPause - 1f)
+                                )
+                            )
                         }
                     )
                     TempSlider(
@@ -1556,8 +1606,7 @@ class MainActivity : ComponentActivity() {
                         // impossible to set Resume ≥ Pause from the UI.
                         maxTemp = pauseTemp - 1f,
                         onValueChange = {
-                            resumeTemp = it
-                            prefs.resumeTempC = it
+                            onChange(value.copy(resumeTemp = it))
                         }
                     )
                     if (!(warnTemp < throttleTemp && throttleTemp < pauseTemp)) {
@@ -1603,8 +1652,7 @@ class MainActivity : ComponentActivity() {
                             if (newValue) {
                                 showExtPowerDialog = true
                             } else {
-                                externalPower = false
-                                prefs.externalPowerMode = false
+                                onChange(value.copy(externalPower = false))
                             }
                         },
                         colors = SwitchDefaults.colors(
@@ -1639,8 +1687,7 @@ class MainActivity : ComponentActivity() {
                         checked = requireCharging,
                         enabled = !externalPower,
                         onCheckedChange = { newValue ->
-                            requireCharging = newValue
-                            prefs.requireCharging = newValue
+                            onChange(value.copy(requireCharging = newValue))
                         },
                         colors = SwitchDefaults.colors(
                             checkedThumbColor = accent,
@@ -1659,9 +1706,7 @@ class MainActivity : ComponentActivity() {
                 Slider(
                     value = batteryCutoff.toFloat(),
                     onValueChange = {
-                        val v = it.roundToInt()
-                        batteryCutoff = v
-                        prefs.batteryCutoffPercent = v
+                        onChange(value.copy(batteryCutoff = it.roundToInt()))
                     },
                     valueRange = MiningPreferences.BATT_CUTOFF_MIN.toFloat()
                         ..MiningPreferences.BATT_CUTOFF_MAX.toFloat(),
@@ -1705,8 +1750,7 @@ class MainActivity : ComponentActivity() {
                 },
                 confirmButton = {
                     TextButton(onClick = {
-                        thermalEnabled = false
-                        prefs.thermalProtectionEnabled = false
+                        onChange(value.copy(thermalEnabled = false))
                         showDisableDialog = false
                     }) {
                         Text("DISABLE", color = warningColor, fontFamily = FontFamily.Monospace)
@@ -1746,8 +1790,7 @@ class MainActivity : ComponentActivity() {
                 },
                 confirmButton = {
                     TextButton(onClick = {
-                        externalPower = true
-                        prefs.externalPowerMode = true
+                        onChange(value.copy(externalPower = true))
                         showExtPowerDialog = false
                     }) {
                         Text("ENABLE", color = accent, fontFamily = FontFamily.Monospace)
