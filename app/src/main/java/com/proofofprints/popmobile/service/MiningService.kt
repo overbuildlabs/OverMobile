@@ -934,6 +934,16 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         miningEngine.setExtranonce(extranonceShifted, extranonce2Bits)
     }
 
+    override fun onAuthorizeFailed(reason: String) {
+        // Leave the connection to the pool: it either closes it (and the
+        // reconnect backoff takes over) or keeps it open without sending jobs.
+        Log.w(TAG, "Pool rejected login: $reason")
+        LogManager.error("Pool rejected the login (check wallet/worker): $reason")
+        poolState = PoolState.ERROR
+        poolErrorReason = "Pool rejected login — check wallet and worker"
+        updateNotification("Pool rejected login")
+    }
+
     // ===== MiningEngine.ShareCallback =====
 
     override fun onShareFound(jobId: String, nonce: Long) {

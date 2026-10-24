@@ -40,6 +40,7 @@ class StratumClient(
         fun onShareAccepted()
         fun onShareRejected(reason: String)
         fun onExtranonceSet(extranonce: String, extranonceShifted: Long, extranonce2Bits: Int)
+        fun onAuthorizeFailed(reason: String)
     }
 
     private var socket: Socket? = null
@@ -53,6 +54,10 @@ class StratumClient(
     @Volatile private var walletWorker: String = ""
     private val pendingShareIds = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
     @Volatile private var extranonce: String = ""  // Bridge-assigned extranonce prefix (hex chars)
+    // Ids of this connection's subscribe/authorize requests, so their
+    // responses can be told apart from each other and from share results.
+    @Volatile private var subscribeId = -1
+    @Volatile private var authorizeId = -1
 
     // java.net.Socket keeps reporting isConnected=true after the peer goes
     // away, so track liveness ourselves. connectionGen identifies the current
@@ -93,12 +98,14 @@ class StratumClient(
                 listener.onConnected()
 
                 // Subscribe
-                sendMessage("mining.subscribe", listOf(worker))
+                subscribeId = sendMessage("mining.subscribe", listOf(worker))
                 delay(500)
 
                 // Authorize
+                // Public pools (e.g. HeroMiners) reject authorize without the
+                // conventional password param; the OverBuild bridge ignores it.
                 walletWorker = "$wallet.$worker"
-                sendMessage("mining.authorize", listOf(walletWorker))
+                authorizeId = sendMessage("mining.authorize", listOf(walletWorker, "x"))
 
                 // Start reading messages
                 startReading(gen)
@@ -174,15 +181,18 @@ class StratumClient(
         LogManager.info("Share submitted - Job: $jobId, Nonce: $nonceHex")
     }
 
-    private fun sendMessage(method: String, params: List<String>) {
+    /** Sends a request and returns its id. */
+    private fun sendMessage(method: String, params: List<String>): Int {
+        val id = messageId.getAndIncrement()
         val msg = JsonObject().apply {
-            addProperty("id", messageId.getAndIncrement())
+            addProperty("id", id)
             addProperty("method", method)
             add("params", JsonArray().apply {
                 params.forEach { add(it) }
             })
         }
         sendRaw(gson.toJson(msg))
+        return id
     }
 
     @Synchronized
@@ -246,7 +256,8 @@ class StratumClient(
                 when (method) {
                     "mining.notify" -> handleNotify(doc)
                     "mining.set_difficulty" -> handleSetDifficulty(doc)
-                    "mining.set_extranonce" -> handleSetExtranonce(doc)
+                    // Some pools (HeroMiners) omit the "mining." prefix.
+                    "mining.set_extranonce", "set_extranonce" -> handleSetExtranonce(doc)
                     else -> Log.w(TAG, "Unknown/unhandled method: $method — raw: $json")
                 }
                 return
@@ -270,8 +281,17 @@ class StratumClient(
                         }
                     }
                 } else {
-                    // Response to subscribe/authorize — just log it
                     Log.d(TAG, "Response for id=$id: ${doc}")
+                    val error = doc.get("error")?.takeUnless { it.isJsonNull }
+                    when (id) {
+                        subscribeId -> handleSubscribeResult(doc)
+                        authorizeId -> if (error != null) {
+                            Log.w(TAG, "Authorize rejected: $error")
+                            listener.onAuthorizeFailed(error.toString())
+                        } else if (doc.get("result")?.let { it.isJsonPrimitive && !it.asBoolean } == true) {
+                            listener.onAuthorizeFailed("login refused")
+                        }
+                    }
                 }
             }
         } catch (e: Exception) {
@@ -335,10 +355,25 @@ class StratumClient(
         }
     }
 
+    /** Some pools hand out the extranonce only in the subscribe result,
+     *  shaped `[<subscriptions or null>, "<extranonce hex>", <en2 size>]`. */
+    private fun handleSubscribeResult(doc: JsonObject) {
+        val result = doc.get("result")?.takeIf { it.isJsonArray }?.asJsonArray ?: return
+        if (result.size() < 2) return
+        val en = result[1].takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString ?: return
+        applyExtranonce(en)
+    }
+
     private fun handleSetExtranonce(doc: JsonObject) {
         try {
-            val params = doc.getAsJsonArray("params")
-            val en = params[0].asString
+            applyExtranonce(doc.getAsJsonArray("params")[0].asString)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error parsing mining.set_extranonce: ${e.message}")
+        }
+    }
+
+    private fun applyExtranonce(en: String) {
+        try {
             if (en.isEmpty()) return  // pool assigns no prefix: keep the full nonce space
             // Validate before adopting it: the native engine needs at least 8
             // free nonce bits (14 hex chars max), and submitShare's takeLast
@@ -361,7 +396,7 @@ class StratumClient(
             Log.i(TAG, "Extranonce nonce prefix: 0x${String.format("%016x", extranonceShifted)}, extranonce2 bits: $extranonce2Bits")
             listener.onExtranonceSet(extranonce, extranonceShifted, extranonce2Bits)
         } catch (e: Exception) {
-            Log.e(TAG, "Error parsing mining.set_extranonce: ${e.message}")
+            Log.e(TAG, "Error applying extranonce: ${e.message}")
         }
     }
 }
