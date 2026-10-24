@@ -39,8 +39,9 @@ class StratumClient(
         fun onDifficultyChanged(difficulty: Double)
         fun onShareAccepted()
         fun onShareRejected(reason: String)
-        fun onExtranonceSet(extranonce: String, extranonceShifted: Long, extranonce2Bits: Int)
+        /** The pool refused mining.authorize (bad wallet or worker name). */
         fun onAuthorizeFailed(reason: String)
+        fun onExtranonceSet(extranonce: String, extranonceShifted: Long, extranonce2Bits: Int)
     }
 
     private var socket: Socket? = null
@@ -53,11 +54,11 @@ class StratumClient(
     private val messageId = AtomicInteger(1)
     @Volatile private var walletWorker: String = ""
     private val pendingShareIds = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
+    /** Id of this connection's mining.authorize, until its response arrives. */
+    @Volatile private var authorizeId: Int = -1
     @Volatile private var extranonce: String = ""  // Bridge-assigned extranonce prefix (hex chars)
-    // Ids of this connection's subscribe/authorize requests, so their
-    // responses can be told apart from each other and from share results.
-    @Volatile private var subscribeId = -1
-    @Volatile private var authorizeId = -1
+    /** Id of this connection's mining.subscribe; some pools put the extranonce in its result. */
+    @Volatile private var subscribeId: Int = -1
 
     // java.net.Socket keeps reporting isConnected=true after the peer goes
     // away, so track liveness ourselves. connectionGen identifies the current
@@ -181,7 +182,7 @@ class StratumClient(
         LogManager.info("Share submitted - Job: $jobId, Nonce: $nonceHex")
     }
 
-    /** Sends a request and returns its id. */
+    /** Returns the request id. */
     private fun sendMessage(method: String, params: List<String>): Int {
         val id = messageId.getAndIncrement()
         val msg = JsonObject().apply {
@@ -278,26 +279,43 @@ class StratumClient(
                         if (result.isJsonPrimitive && result.asBoolean) {
                             Log.i(TAG, "Share accepted! (id=$id)")
                             listener.onShareAccepted()
+                        } else if (result.isJsonNull || result.isJsonPrimitive) {
+                            // result false/null with no error object is
+                            // still a rejection; it used to be dropped.
+                            Log.w(TAG, "Share rejected (id=$id): result=$result")
+                            listener.onShareRejected("rejected by pool")
                         }
+                    }
+                } else if (id == authorizeId) {
+                    authorizeId = -1
+                    val error = doc.get("error")?.takeIf { !it.isJsonNull }
+                    val result = doc.get("result")
+                    val ok = error == null && result != null && !result.isJsonNull &&
+                        !(result.isJsonPrimitive && result.asJsonPrimitive.isBoolean && !result.asBoolean)
+                    if (ok) {
+                        Log.i(TAG, "Authorized")
+                    } else {
+                        val reason = error?.let { errorMessage(it) } ?: "not authorized"
+                        Log.w(TAG, "Authorize failed: $reason")
+                        listener.onAuthorizeFailed(reason)
                     }
                 } else {
                     Log.d(TAG, "Response for id=$id: ${doc}")
-                    val error = doc.get("error")?.takeUnless { it.isJsonNull }
-                    when (id) {
-                        subscribeId -> handleSubscribeResult(doc)
-                        authorizeId -> if (error != null) {
-                            Log.w(TAG, "Authorize rejected: $error")
-                            listener.onAuthorizeFailed(error.toString())
-                        } else if (doc.get("result")?.let { it.isJsonPrimitive && !it.asBoolean } == true) {
-                            listener.onAuthorizeFailed("login refused")
-                        }
-                    }
+                    if (id == subscribeId) handleSubscribeResult(doc)
                 }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error parsing message: ${e.message}")
         }
     }
+
+    /** Stratum errors are usually [code, "message", data]; fall back to the
+     *  raw JSON for anything else. */
+    private fun errorMessage(e: com.google.gson.JsonElement): String = runCatching {
+        if (e.isJsonArray && e.asJsonArray.size() >= 2) e.asJsonArray[1].asString
+        else if (e.isJsonObject && e.asJsonObject.has("message")) e.asJsonObject.get("message").asString
+        else e.toString()
+    }.getOrDefault(e.toString()).take(80)
 
     private fun handleNotify(doc: JsonObject) {
         try {
