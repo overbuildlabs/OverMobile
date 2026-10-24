@@ -32,6 +32,16 @@ internal object FieldValidators {
     /** Pool stratum workers commonly reject spaces and most punctuation. */
     private val WORKER_NAME_REGEX = Regex("""^[A-Za-z0-9_\-.]{1,64}$""")
 
+    /**
+     * Fixes the two pool-URL slips we see in practice before validation:
+     * surrounding whitespace and a missing colon (`stratum+tcp//host:port`).
+     * Anything else is returned trimmed but otherwise untouched.
+     */
+    fun normalizePoolUrl(value: String): String {
+        val v = value.trim()
+        return if (v.startsWith("stratum+tcp//")) "stratum+tcp://" + v.removePrefix("stratum+tcp//") else v
+    }
+
     fun validatePoolUrl(value: String): String? {
         val v = value.trim()
         if (v.isEmpty()) return "Pool URL is required"

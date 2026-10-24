@@ -162,6 +162,139 @@ class MainActivity : ComponentActivity() {
         var showLogs by remember { mutableStateOf(false) }
         var showAbout by remember { mutableStateOf(false) }
 
+        // OverManager fields edited on the Settings screen. Hoisted here (not
+        // kept inside SettingsPanel) so the sticky Save bar and the
+        // leave-with-unsaved-changes prompt can see and revert them.
+        val popPrefs = getSharedPreferences("popmanager", Context.MODE_PRIVATE)
+        val defaultDeviceName = "${Build.MANUFACTURER} ${Build.MODEL}"
+        var popServerUrl by remember { mutableStateOf(popPrefs.getString("server_url", "") ?: "") }
+        var popDeviceName by remember {
+            mutableStateOf(popPrefs.getString("device_name", defaultDeviceName) ?: defaultDeviceName)
+        }
+
+        // Last-saved values of every field Save persists. The Settings screen
+        // is "dirty" whenever the live fields differ from this snapshot.
+        var savedSettings by remember {
+            mutableStateOf(SavedSettings(poolUrl, wallet, worker, threads, popServerUrl, popDeviceName))
+        }
+        // Read state at call time (not a composition-time val) so callbacks
+        // never act on a stale answer.
+        fun isSettingsDirty() = showSettings &&
+            SavedSettings(poolUrl, wallet, worker, threads, popServerUrl, popDeviceName) != savedSettings
+        val settingsDirty = isSettingsDirty()
+        var showSaved by remember { mutableStateOf(false) }
+        // Navigation the user attempted while Settings had unsaved changes;
+        // non-null means the "Unsaved changes" dialog is showing.
+        var pendingNavigation by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+        fun revertSettings() {
+            poolUrl = savedSettings.poolUrl
+            wallet = savedSettings.wallet
+            worker = savedSettings.worker
+            threads = savedSettings.threads
+            popServerUrl = savedSettings.popServerUrl
+            popDeviceName = savedSettings.popDeviceName
+        }
+
+        // Single save path for the Save bar and the unsaved-changes dialog.
+        // Returns false (and toasts the error) when validation fails, in which
+        // case nothing is written.
+        fun saveSettings(): Boolean {
+            poolUrl = FieldValidators.normalizePoolUrl(poolUrl)
+            // Same rule as the inline field errors: blank fields are allowed
+            // to be saved (the Start Mining check catches them), but a
+            // non-blank malformed value is not.
+            val error = poolUrl.takeIf { it.isNotBlank() }
+                ?.let { FieldValidators.validatePoolUrl(it) }?.let { "Pool: $it" }
+                ?: wallet.takeIf { it.isNotBlank() }
+                    ?.let { FieldValidators.validateWalletAddress(it) }?.let { "Wallet: $it" }
+                ?: worker.takeIf { it.isNotBlank() }
+                    ?.let { FieldValidators.validateWorkerName(it) }?.let { "Worker: $it" }
+            if (error != null) {
+                android.widget.Toast.makeText(
+                    this@MainActivity, error, android.widget.Toast.LENGTH_LONG
+                ).show()
+                return false
+            }
+            popServerUrl = popServerUrl.trimEnd('/')
+            prefs.edit()
+                .putString("pool_url", poolUrl)
+                .putString("wallet", wallet)
+                .putString("worker", worker)
+                .putInt("threads", threads)
+                .apply()
+            // Persist OverManager settings directly to its prefs file
+            popPrefs.edit()
+                .putString("server_url", popServerUrl)
+                .putString("device_name", popDeviceName)
+                .apply()
+            // Restart reporter so it picks up the new server URL /
+            // device name. If the URL now names a different server,
+            // the reporter drops the old server's credentials and asks
+            // for a pairing code (see dropCredentialsIfServerChanged).
+            miningService?.let { svc ->
+                svc.popManagerReporter.stop()
+                svc.popManagerReporter.start()
+            }
+            // If OverManager is configured and service isn't running,
+            // kick it so the reporter begins immediately.
+            if (popServerUrl.isNotBlank()) {
+                val intent = Intent(this@MainActivity, MiningService::class.java).apply {
+                    action = MiningService.ACTION_ENSURE_RUNNING
+                }
+                ContextCompat.startForegroundService(this@MainActivity, intent)
+            }
+            savedSettings = SavedSettings(poolUrl, wallet, worker, threads, popServerUrl, popDeviceName)
+            showSaved = true
+            return true
+        }
+
+        // Every way off the Settings screen goes through here so unsaved
+        // edits are never silently dropped (or silently kept, half-applied).
+        fun navigate(action: () -> Unit) {
+            if (isSettingsDirty()) pendingNavigation = action else action()
+        }
+
+        // System back from Settings returns to the Dashboard (prompting first
+        // if there are unsaved changes) instead of leaving the app.
+        androidx.activity.compose.BackHandler(enabled = showSettings) {
+            navigate { showSettings = false }
+        }
+
+        pendingNavigation?.let { proceed ->
+            AlertDialog(
+                onDismissRequest = { pendingNavigation = null },
+                containerColor = Color(0xFF16161B),
+                title = { Text("Unsaved changes", color = Color.White) },
+                text = {
+                    Text(
+                        "You have settings that haven't been saved.",
+                        color = Color.Gray
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        pendingNavigation = null
+                        // Stay on Settings if validation fails; the toast
+                        // says what to fix.
+                        if (saveSettings()) proceed()
+                    }) { Text("Save", color = Color(0xFF10B981), fontWeight = FontWeight.Bold) }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton(onClick = {
+                            pendingNavigation = null
+                            revertSettings()
+                            proceed()
+                        }) { Text("Discard", color = Color(0xFFFF4444)) }
+                        TextButton(onClick = { pendingNavigation = null }) {
+                            Text("Keep editing", color = Color.Gray)
+                        }
+                    }
+                }
+            )
+        }
+
         // Update checker
         val appContext = this@MainActivity.applicationContext
         val updateChecker = remember { UpdateChecker(appContext) }
@@ -255,6 +388,16 @@ class MainActivity : ComponentActivity() {
                 if (freshWorker != worker && !showSettings) worker = freshWorker
                 val freshThreads = prefs.getInt("threads", 2)
                 if (freshThreads != threads && !showSettings) threads = freshThreads
+                if (!showSettings) {
+                    popServerUrl = popPrefs.getString("server_url", "") ?: ""
+                    popDeviceName = popPrefs.getString("device_name", defaultDeviceName)
+                        ?: defaultDeviceName
+                    // Outside Settings the fields mirror prefs, so they are
+                    // by definition the last-saved values.
+                    savedSettings = SavedSettings(
+                        poolUrl, wallet, worker, threads, popServerUrl, popDeviceName
+                    )
+                }
 
                 delay(1000)
             }
@@ -305,8 +448,10 @@ class MainActivity : ComponentActivity() {
                     ),
                     actions = {
                         IconButton(onClick = {
-                            if (showAbout) { showAbout = false }
-                            else { showAbout = true; showSettings = false; showLogs = false }
+                            navigate {
+                                if (showAbout) { showAbout = false }
+                                else { showAbout = true; showSettings = false; showLogs = false }
+                            }
                         }) {
                             Icon(
                                 imageVector = Icons.Outlined.Info,
@@ -317,8 +462,10 @@ class MainActivity : ComponentActivity() {
                         }
                         // Logs / Dashboard toggle
                         TextButton(onClick = {
-                            if (showLogs || showAbout || showSettings) { showLogs = false; showSettings = false; showAbout = false }
-                            else { showLogs = true; showSettings = false; showAbout = false }
+                            navigate {
+                                if (showLogs || showAbout || showSettings) { showLogs = false; showSettings = false; showAbout = false }
+                                else { showLogs = true; showSettings = false; showAbout = false }
+                            }
                         }) {
                             Text(
                                 if (showLogs || showAbout || showSettings) "Dashboard" else "Logs",
@@ -327,8 +474,10 @@ class MainActivity : ComponentActivity() {
                         }
                         // Settings button
                         TextButton(onClick = {
-                            if (showSettings) { showSettings = false }
-                            else { showSettings = true; showLogs = false; showAbout = false }
+                            navigate {
+                                if (showSettings) { showSettings = false }
+                                else { showSettings = true; showLogs = false; showAbout = false }
+                            }
                         }) {
                             Text("Settings", color = Color(0xFF10B981))
                         }
@@ -342,52 +491,75 @@ class MainActivity : ComponentActivity() {
                         .fillMaxSize()
                         .background(Color(0xFF0C0C0F))
                         .padding(padding)
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    if (showAbout) {
-                        AboutPanel(
-                            checking = checkingForUpdate,
-                            resultMessage = updateCheckResult,
-                            lastCheckedMs = lastCheckedMs,
-                            onCheckForUpdate = {
-                                checkingForUpdate = true
-                                updateCheckResult = null
-                                updateScope.launch {
-                                    val found = updateChecker.checkForUpdate(force = true)
-                                    checkingForUpdate = false
-                                    lastCheckedMs = updateChecker.lastCheckTimestampMs()
-                                    if (found != null) {
-                                        availableUpdate = found
-                                        updateCheckResult = null
-                                    } else {
-                                        updateCheckResult = "You're on the latest version."
+                    // Settings gets a Save / Cancel bar pinned above the scrolling
+                    // content; it used to be a button at the very bottom of the
+                    // list, where users didn't find it.
+                    if (showSettings) {
+                        SettingsSaveBar(
+                            dirty = settingsDirty,
+                            showSaved = showSaved,
+                            onSavedShown = { showSaved = false },
+                            onSave = { saveSettings() },
+                            onCancel = { revertSettings() }
+                        )
+                    }
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        if (showAbout) {
+                            AboutPanel(
+                                checking = checkingForUpdate,
+                                resultMessage = updateCheckResult,
+                                lastCheckedMs = lastCheckedMs,
+                                onCheckForUpdate = {
+                                    checkingForUpdate = true
+                                    updateCheckResult = null
+                                    updateScope.launch {
+                                        val found = updateChecker.checkForUpdate(force = true)
+                                        checkingForUpdate = false
+                                        lastCheckedMs = updateChecker.lastCheckTimestampMs()
+                                        if (found != null) {
+                                            availableUpdate = found
+                                            updateCheckResult = null
+                                        } else {
+                                            updateCheckResult = "You're on the latest version."
+                                        }
                                     }
                                 }
-                            }
-                        )
-                    } else if (showLogs) {
-                        LogsPanel()
-                    } else {
-                        SettingsPanel(
-                            poolUrl = poolUrl,
-                            wallet = wallet,
-                            worker = worker,
-                            threads = threads,
-                            onPoolUrlChange = { poolUrl = it },
-                            onWalletChange = { wallet = it },
-                            onWorkerChange = { worker = it },
-                            onThreadsChange = { threads = it },
-                            onSave = {
-                                prefs.edit()
-                                    .putString("pool_url", poolUrl)
-                                    .putString("wallet", wallet)
-                                    .putString("worker", worker)
-                                    .putInt("threads", threads)
-                                    .apply()
-                            }
-                        )
+                            )
+                        } else if (showLogs) {
+                            LogsPanel()
+                        } else {
+                            SettingsPanel(
+                                poolUrl = poolUrl,
+                                wallet = wallet,
+                                worker = worker,
+                                threads = threads,
+                                onPoolUrlChange = { poolUrl = it },
+                                onWalletChange = { wallet = it },
+                                onWorkerChange = { worker = it },
+                                onThreadsChange = { threads = it },
+                                popServerUrl = popServerUrl,
+                                popDeviceName = popDeviceName,
+                                onPopServerUrlChange = { popServerUrl = it },
+                                onPopDeviceNameChange = { popDeviceName = it },
+                                onPopSettingsPersisted = {
+                                    // Pairing writes server URL + device name on
+                                    // its own; those values are now the saved ones.
+                                    savedSettings = savedSettings.copy(
+                                        popServerUrl = popServerUrl.trimEnd('/'),
+                                        popDeviceName = popDeviceName
+                                    )
+                                    popServerUrl = popServerUrl.trimEnd('/')
+                                }
+                            )
+                        }
                     }
                 }
             } else {
@@ -549,6 +721,7 @@ class MainActivity : ComponentActivity() {
                                 // first error as a toast instead of silently
                                 // doing nothing. Button stays enabled so the
                                 // user always gets feedback.
+                                poolUrl = FieldValidators.normalizePoolUrl(poolUrl)
                                 val error = FieldValidators.firstError(poolUrl, wallet, worker)
                                 if (error != null) {
                                     android.widget.Toast.makeText(
@@ -793,23 +966,20 @@ class MainActivity : ComponentActivity() {
         onWalletChange: (String) -> Unit,
         onWorkerChange: (String) -> Unit,
         onThreadsChange: (Int) -> Unit,
-        onSave: () -> Unit
+        popServerUrl: String,
+        popDeviceName: String,
+        onPopServerUrlChange: (String) -> Unit,
+        onPopDeviceNameChange: (String) -> Unit,
+        onPopSettingsPersisted: () -> Unit
     ) {
         // The native engine runs at most 8 workers (MAX_THREADS in
         // mining_engine.c); offering more would show a count it never uses.
         val maxThreads = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
-        var showSaved by remember { mutableStateOf(false) }
 
-        // OverManager settings (read/write directly against the popmanager prefs file
-        // so the reporter in MiningService sees changes immediately)
+        // OverManager settings. The editable fields are hoisted into
+        // MinerDashboard (saved by the Save bar); pairing still writes the
+        // popmanager prefs file directly so the reporter sees it immediately.
         val popPrefs = getSharedPreferences("popmanager", Context.MODE_PRIVATE)
-        val defaultName = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}"
-        var popServerUrl by remember {
-            mutableStateOf(popPrefs.getString("server_url", "") ?: "")
-        }
-        var popDeviceName by remember {
-            mutableStateOf(popPrefs.getString("device_name", defaultName) ?: defaultName)
-        }
         var popTestResult by remember { mutableStateOf<String?>(null) }
         var popTesting by remember { mutableStateOf(false) }
         var popPairingCode by remember { mutableStateOf("") }
@@ -852,7 +1022,9 @@ class MainActivity : ComponentActivity() {
                     // catches empty-required fields.
                     val poolUrlError = remember(poolUrl) {
                         if (poolUrl.isBlank()) null
-                        else FieldValidators.validatePoolUrl(poolUrl)
+                        // Validate what Save will store, so a fixable typo
+                        // like a missing ':' doesn't show a red error.
+                        else FieldValidators.validatePoolUrl(FieldValidators.normalizePoolUrl(poolUrl))
                     }
                     val walletError = remember(wallet) {
                         if (wallet.isBlank()) null
@@ -993,7 +1165,7 @@ class MainActivity : ComponentActivity() {
                     OutlinedButton(
                         onClick = {
                             launchPairingQrScanner { scannedUrl, scannedCode ->
-                                popServerUrl = scannedUrl
+                                onPopServerUrlChange(scannedUrl)
                                 popPairingCode = scannedCode
                                 popTestResult = null
                                 popPairResult = null
@@ -1013,9 +1185,9 @@ class MainActivity : ComponentActivity() {
                     MinerTextField(
                         "Server URL (http://host:8787)",
                         popServerUrl
-                    ) { popServerUrl = it; popTestResult = null }
+                    ) { onPopServerUrlChange(it); popTestResult = null }
 
-                    MinerTextField("Device Name", popDeviceName) { popDeviceName = it }
+                    MinerTextField("Device Name", popDeviceName, onValueChange = onPopDeviceNameChange)
 
                     // --- Pairing code row (only shown when pairing is required
                     //     OR user wants to re-pair) ---
@@ -1116,6 +1288,7 @@ class MainActivity : ComponentActivity() {
                                             .putString("server_url", popServerUrl.trimEnd('/'))
                                             .putString("device_name", popDeviceName)
                                             .apply()
+                                        onPopSettingsPersisted()
                                         // Keep the service in the foreground so
                                         // reporting continues once the app is
                                         // backgrounded (Save does the same).
@@ -1166,56 +1339,83 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
 
-            // ========= SAVED NOTICE (above the button so it's visible) =========
-            if (showSaved) {
-                LaunchedEffect(Unit) {
-                    delay(2000)
-                    showSaved = false
-                }
-                Text(
-                    "Settings saved!",
-                    color = Color(0xFF10B981),
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.Monospace,
-                    modifier = Modifier.fillMaxWidth(),
-                    textAlign = TextAlign.Center
-                )
+    /** Every field the Settings Save button persists, for dirty tracking. */
+    private data class SavedSettings(
+        val poolUrl: String,
+        val wallet: String,
+        val worker: String,
+        val threads: Int,
+        val popServerUrl: String,
+        val popDeviceName: String
+    )
+
+    /** Save / Cancel bar pinned above the scrolling Settings content. Both
+     *  buttons are disabled until something differs from the saved values. */
+    @Composable
+    fun SettingsSaveBar(
+        dirty: Boolean,
+        showSaved: Boolean,
+        onSavedShown: () -> Unit,
+        onSave: () -> Unit,
+        onCancel: () -> Unit
+    ) {
+        if (showSaved) {
+            LaunchedEffect(Unit) {
+                delay(2000)
+                onSavedShown()
             }
-
-            // ========= SAVE BUTTON =========
-            Button(
-                onClick = {
-                    onSave()
-                    // Persist OverManager settings directly to its prefs file
-                    popPrefs.edit()
-                        .putString("server_url", popServerUrl.trimEnd('/'))
-                        .putString("device_name", popDeviceName)
-                        .apply()
-                    // Restart reporter so it picks up the new server URL /
-                    // device name. If the URL now names a different server,
-                    // the reporter drops the old server's credentials and asks
-                    // for a pairing code (see dropCredentialsIfServerChanged).
-                    miningService?.let { svc ->
-                        svc.popManagerReporter.stop()
-                        svc.popManagerReporter.start()
-                    }
-                    // If OverManager is configured and service isn't running,
-                    // kick it so the reporter begins immediately.
-                    if (popServerUrl.isNotBlank()) {
-                        val intent = Intent(this@MainActivity, MiningService::class.java).apply {
-                            action = MiningService.ACTION_ENSURE_RUNNING
-                        }
-                        ContextCompat.startForegroundService(this@MainActivity, intent)
-                    }
-                    showSaved = true
-                },
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(Color(0xFF16161B))
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            val (status, statusColor) = when {
+                dirty -> "Unsaved changes" to Color(0xFFFBBF24)
+                showSaved -> "Settings saved" to Color(0xFF10B981)
+                else -> "No changes" to Color.Gray
+            }
+            Text(
+                status,
+                color = statusColor,
+                fontSize = 13.sp,
+                fontWeight = if (dirty) FontWeight.Bold else FontWeight.Normal,
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedButton(
+                onClick = onCancel,
+                enabled = dirty,
                 shape = RoundedCornerShape(8.dp)
             ) {
-                Text("SAVE", color = Color.Black, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                Text(
+                    "CANCEL",
+                    color = if (dirty) Color.White else Color.Gray,
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+            Button(
+                onClick = onSave,
+                enabled = dirty,
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFF10B981),
+                    disabledContainerColor = Color(0xFF1F1F26)
+                )
+            ) {
+                Text(
+                    "SAVE",
+                    color = if (dirty) Color.Black else Color.Gray,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.Monospace
+                )
             }
         }
     }

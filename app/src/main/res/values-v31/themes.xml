@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Android 12+ draws a system splash before SplashActivity's first frame.
+         Its background otherwise follows the platform default (white on many
+         devices/emulators), so pin it to the app surface colour. -->
+    <style name="Theme.KASMiner" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#16161B</item>
+        <item name="android:navigationBarColor">#0C0C0F</item>
+        <item name="android:windowBackground">#0C0C0F</item>
+        <item name="android:windowSplashScreenBackground">#0C0C0F</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">#0C0C0F</item>
+    </style>
+</resources>
