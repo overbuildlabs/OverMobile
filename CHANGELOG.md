@@ -63,6 +63,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   and the wallet no longer appears in release logcat.
 
 ### Fixed
+- **Protection options now go through Save / Cancel.** Thermal and power
+  settings (thermal protection, warn / throttle / pause / resume
+  temperatures, external power mode, require charging, battery cutoff) used
+  to apply the instant you touched them, so the Save bar never lit up and
+  Cancel couldn't undo them. They are now staged like the rest of Settings:
+  they mark the screen as unsaved, Cancel and Discard revert them, and the
+  miner only uses the new limits after Save.
+- **System Back from Settings now asks about unsaved changes.** Two Back
+  handlers conflicted, so the prompt was skipped and Back left Settings
+  with the edits still on screen.
 - **Works with public pools such as HeroMiners.** The login now sends the
   standard password field (pools rejected it with "Invalid params"), and the
   pool's nonce prefix is picked up whether it arrives as `set_extranonce`,
