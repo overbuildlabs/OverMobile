@@ -46,6 +46,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   and the wallet no longer appears in release logcat.
 
 ### Fixed
+- **Works with public pools such as HeroMiners.** The login now sends the
+  standard password field (pools rejected it with "Invalid params"), and the
+  pool's nonce prefix is picked up whether it arrives as `set_extranonce`,
+  `mining.set_extranonce`, or in the subscribe reply — previously it was
+  ignored, so shares would have been rejected.
 - **"Require charging" pauses now hold.** With the phone unplugged, the
   miner restarted every 30 seconds and stopped again straight away. Each
   pause now remembers its cause (heat, low battery, unplugged) and resumes

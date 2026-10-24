@@ -57,6 +57,8 @@ class StratumClient(
     /** Id of this connection's mining.authorize, until its response arrives. */
     @Volatile private var authorizeId: Int = -1
     @Volatile private var extranonce: String = ""  // Bridge-assigned extranonce prefix (hex chars)
+    /** Id of this connection's mining.subscribe; some pools put the extranonce in its result. */
+    @Volatile private var subscribeId: Int = -1
 
     // java.net.Socket keeps reporting isConnected=true after the peer goes
     // away, so track liveness ourselves. connectionGen identifies the current
@@ -97,12 +99,14 @@ class StratumClient(
                 listener.onConnected()
 
                 // Subscribe
-                sendMessage("mining.subscribe", listOf(worker))
+                subscribeId = sendMessage("mining.subscribe", listOf(worker))
                 delay(500)
 
                 // Authorize
+                // Public pools (e.g. HeroMiners) reject authorize without the
+                // conventional password param; the OverBuild bridge ignores it.
                 walletWorker = "$wallet.$worker"
-                authorizeId = sendMessage("mining.authorize", listOf(walletWorker))
+                authorizeId = sendMessage("mining.authorize", listOf(walletWorker, "x"))
 
                 // Start reading messages
                 startReading(gen)
@@ -253,7 +257,8 @@ class StratumClient(
                 when (method) {
                     "mining.notify" -> handleNotify(doc)
                     "mining.set_difficulty" -> handleSetDifficulty(doc)
-                    "mining.set_extranonce" -> handleSetExtranonce(doc)
+                    // Some pools (HeroMiners) omit the "mining." prefix.
+                    "mining.set_extranonce", "set_extranonce" -> handleSetExtranonce(doc)
                     else -> Log.w(TAG, "Unknown/unhandled method: $method — raw: $json")
                 }
                 return
@@ -295,8 +300,8 @@ class StratumClient(
                         listener.onAuthorizeFailed(reason)
                     }
                 } else {
-                    // Response to subscribe/authorize — just log it
                     Log.d(TAG, "Response for id=$id: ${doc}")
+                    if (id == subscribeId) handleSubscribeResult(doc)
                 }
             }
         } catch (e: Exception) {
@@ -368,10 +373,25 @@ class StratumClient(
         }
     }
 
+    /** Some pools hand out the extranonce only in the subscribe result,
+     *  shaped `[<subscriptions or null>, "<extranonce hex>", <en2 size>]`. */
+    private fun handleSubscribeResult(doc: JsonObject) {
+        val result = doc.get("result")?.takeIf { it.isJsonArray }?.asJsonArray ?: return
+        if (result.size() < 2) return
+        val en = result[1].takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString ?: return
+        applyExtranonce(en)
+    }
+
     private fun handleSetExtranonce(doc: JsonObject) {
         try {
-            val params = doc.getAsJsonArray("params")
-            val en = params[0].asString
+            applyExtranonce(doc.getAsJsonArray("params")[0].asString)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error parsing mining.set_extranonce: ${e.message}")
+        }
+    }
+
+    private fun applyExtranonce(en: String) {
+        try {
             if (en.isEmpty()) return  // pool assigns no prefix: keep the full nonce space
             // Validate before adopting it: the native engine needs at least 8
             // free nonce bits (14 hex chars max), and submitShare's takeLast
@@ -394,7 +414,7 @@ class StratumClient(
             Log.i(TAG, "Extranonce nonce prefix: 0x${String.format("%016x", extranonceShifted)}, extranonce2 bits: $extranonce2Bits")
             listener.onExtranonceSet(extranonce, extranonceShifted, extranonce2Bits)
         } catch (e: Exception) {
-            Log.e(TAG, "Error parsing mining.set_extranonce: ${e.message}")
+            Log.e(TAG, "Error applying extranonce: ${e.message}")
         }
     }
 }
