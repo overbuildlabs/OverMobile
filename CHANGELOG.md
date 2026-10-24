@@ -4,7 +4,24 @@ All notable changes to OverMobile are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **Save / Cancel bar at the top of Settings.** The Save button used to sit
+  at the very bottom of a long list. A bar now stays pinned above the
+  settings while you scroll: it says "Unsaved changes" (amber) once you edit
+  something, Save validates and stores the miner and OverManager fields, and
+  Cancel puts them back to the last saved values. Both stay disabled while
+  nothing has changed. The old bottom Save button is gone.
+- **Unsaved-changes prompt.** Leaving Settings (Dashboard, Logs, About, or
+  the system back button) with unsaved edits asks whether to Save, Discard
+  or Keep editing. System back from Settings now returns to the Dashboard
+  instead of leaving the app.
+
 ### Changed
+- **Pool URL typos are tidied before checking.** Surrounding spaces are
+  trimmed and `stratum+tcp//host:port` (missing colon) is corrected to
+  `stratum+tcp://host:port` when you save or start mining.
+- **Dark system splash on Android 12+.** The launch splash background now
+  matches the app's dark theme instead of flashing a light screen.
 - **New OverMobile app icon.** OverMobile has its own mark instead of the
   company logo: the OverBuild Labs faceted hexagon holding a purple phone
   with the company cube inside. Same family as the OverManager icon.
