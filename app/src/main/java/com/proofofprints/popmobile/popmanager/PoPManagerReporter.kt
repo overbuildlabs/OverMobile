@@ -24,6 +24,9 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.proofofprints.popmobile.LogManager
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
@@ -57,7 +60,17 @@ class PoPManagerReporter(
         private const val MAX_INTERVAL_SECONDS = 3600
         /** Largest HTTP response body we read from OverManager. */
         private const val MAX_RESPONSE_BYTES = 1_000_000
+        /** Wait used when a 429 from /register names no retry time. */
+        private const val DEFAULT_PAIR_RETRY_SECONDS = 60
+        /** Cap on a server-supplied pairing wait, so a bad value can't lock
+         *  the Pair button for hours. */
+        private const val MAX_PAIR_RETRY_SECONDS = 3600
     }
+
+    /** pairWithCode failure for HTTP 429: OverManager is refusing pairing
+     *  attempts for [retryAfterSeconds] after too many wrong codes. */
+    class PairingThrottledException(val retryAfterSeconds: Int) :
+        Exception("Too many pairing attempts. Try again in ${retryAfterSeconds}s.")
 
     /** Supplies live stats to the reporter on each tick. */
     interface StatsProvider {
@@ -112,17 +125,43 @@ class PoPManagerReporter(
 
     @Volatile private var commandExecutor: CommandExecutor? = null
 
-    /** Observable state for UI. */
+    /** Observable state for UI. Every write also republishes [state] so the
+     *  settings card reacts live (e.g. when OverManager deletes the device and
+     *  the next report clears the credentials). */
     @Volatile var lastStatus: String = "idle"   // idle | registering | reporting | error | disabled | pairing_required
-        private set
+        private set(value) { field = value; publishState() }
     @Volatile var lastError: String? = null
-        private set
+        private set(value) { field = value; publishState() }
     @Volatile var lastReportAt: Long = 0L
         private set
     /** True when the app has a server URL but no valid apiKey — the user must
      *  enter a pairing code from OverManager before reporting can start. */
     @Volatile var pairingRequired: Boolean = false
-        private set
+        private set(value) { field = value; publishState() }
+
+    /** Snapshot of the pairing/reporting state for the UI. */
+    data class PairingState(
+        val hasCredentials: Boolean,
+        val pairingRequired: Boolean,
+        val status: String,
+        val error: String?
+    )
+
+    // Declared after the fields above; their initialisers don't run the
+    // setters, so publishState() never sees this uninitialised.
+    private val _state = MutableStateFlow(
+        PairingState(prefs.getString(KEY_API_KEY, null) != null, false, "idle", null)
+    )
+    val state: StateFlow<PairingState> = _state.asStateFlow()
+
+    private fun publishState() {
+        _state.value = PairingState(
+            hasCredentials = prefs.getString(KEY_API_KEY, null) != null,
+            pairingRequired = pairingRequired,
+            status = lastStatus,
+            error = lastError
+        )
+    }
 
     val deviceId: String
         get() {
@@ -325,6 +364,28 @@ class PoPManagerReporter(
             .remove(KEY_CREDS_SERVER)
             .apply()
         Log.i(TAG, "Credentials cleared")
+        publishState()
+    }
+
+    /** User asked to forget this OverManager. Drops the credentials so the
+     *  phone stops reporting and stops taking commands; mining is untouched.
+     *  The report loop keeps running but idles while [pairingRequired] is
+     *  set, so a later pair resumes reporting without restarting it. The
+     *  clear is repeated under [reportLock] so a report or reconnect already
+     *  in flight can't finish afterwards and leave the old key behind. */
+    fun unpair() {
+        markUnpaired()
+        LogManager.info("OverManager pairing removed")
+        scope.launch {
+            synchronized(reportLock) { markUnpaired() }
+        }
+    }
+
+    private fun markUnpaired() {
+        clearCredentials()
+        pairingRequired = true
+        lastStatus = "pairing_required"
+        lastError = null
     }
 
     // ===== Registration =====
@@ -351,6 +412,7 @@ class PoPManagerReporter(
             .putString(KEY_REPORT_URL, url)
             .putString(KEY_CREDS_SERVER, serverUrl)
             .apply()
+        publishState()
     }
 
     private fun clampInterval(v: Int?): Int =
@@ -466,19 +528,34 @@ class PoPManagerReporter(
                 // Wake up the report loop so the first real report fires now
                 reportNow()
                 Result.success("Paired with OverManager")
+            } else if (response.code == 429) {
+                // OverManager throttles repeated wrong codes. Hand the wait to
+                // the UI so it can count down instead of letting the user burn
+                // more attempts.
+                val secs = json?.get("retryAfterSeconds")
+                    ?.takeIf { it.isJsonPrimitive }?.asString?.toIntOrNull()
+                    ?: response.retryAfter?.trim()?.toIntOrNull()
+                    ?: DEFAULT_PAIR_RETRY_SECONDS
+                val retry = secs.coerceIn(1, MAX_PAIR_RETRY_SECONDS)
+                Log.w(TAG, "Pair 429: retry in ${retry}s")
+                LogManager.warn("OverManager pairing throttled: try again in ${retry}s")
+                restoreStatusAfterFailedPair()
+                Result.failure(PairingThrottledException(retry))
             } else if (response.code == 401) {
-                // Spec (OverManager v1.0.2): any 401 from the register endpoint
-                // means the pairing code has been consumed or has rotated. The
-                // user-visible string is fixed so OverManager and OverMobile
-                // agree on the wording.
-                val serverErr = json?.get("error")?.asString
+                // A wrong code and a consumed/rotated one both come back as
+                // 401. OverManager says "Invalid pairing code" when the code
+                // doesn't match; anything else keeps the expired wording.
+                val serverErr = json?.get("error")?.takeIf { it.isJsonPrimitive }?.asString
+                val wrongCode = serverErr?.contains("invalid pairing code", ignoreCase = true) == true
                 Log.w(TAG, "Pair 401: ${serverErr ?: "expired"}")
-                LogManager.warn("OverManager pairing failed: pairing code expired" +
+                LogManager.warn("OverManager pairing failed: " +
+                    (if (wrongCode) "wrong pairing code" else "pairing code expired") +
                     (serverErr?.let { " (server: $it)" } ?: ""))
-                pairingRequired = true
-                lastStatus = "pairing_required"
-                val userMsg = "Pairing code expired. Get a fresh code from OverManager."
-                lastError = userMsg
+                restoreStatusAfterFailedPair()
+                val userMsg = if (wrongCode)
+                    "Wrong pairing code. Check the code in OverManager."
+                else
+                    "Pairing code expired. Get a fresh code from OverManager."
                 Result.failure(Exception(userMsg))
             } else {
                 val err = json?.get("error")?.asString ?: "HTTP ${response.code}"
@@ -494,6 +571,19 @@ class PoPManagerReporter(
             lastStatus = "error"
             lastError = e.message
             Result.failure(e)
+        }
+    }
+
+    /** A rejected pairing code says nothing about the stored key: when the
+     *  user was re-pairing an already-paired phone, keep reporting with the
+     *  existing credentials instead of dropping into pairing_required (the
+     *  report loop would then idle with a perfectly good key). */
+    private fun restoreStatusAfterFailedPair() {
+        if (apiKey == null) {
+            pairingRequired = true
+            lastStatus = "pairing_required"
+        } else {
+            lastStatus = if (lastReportAt > 0L) "reporting" else "idle"
         }
     }
 
@@ -695,7 +785,7 @@ class PoPManagerReporter(
         out.toString(Charsets.UTF_8.name())
     }
 
-    private data class HttpResponse(val code: Int, val body: String)
+    private data class HttpResponse(val code: Int, val body: String, val retryAfter: String? = null)
 
     private fun httpPost(
         urlStr: String,
@@ -719,7 +809,7 @@ class PoPManagerReporter(
 
             val stream = if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
             val body = stream?.let { readCapped(it) } ?: ""
-            return HttpResponse(conn.responseCode, body)
+            return HttpResponse(conn.responseCode, body, conn.getHeaderField("Retry-After"))
         } finally {
             conn.disconnect()
         }

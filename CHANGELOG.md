@@ -15,6 +15,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   the system back button) with unsaved edits asks whether to Save, Discard
   or Keep editing. System back from Settings now returns to the Dashboard
   instead of leaving the app.
+- **Remove pairing.** While paired, the OverManager card has a red Remove
+  pairing button. After you confirm, the phone stops reporting to
+  OverManager and stops taking its commands until you pair again; mining
+  keeps running. The card switches to "Pairing required" straight away.
+- **Re-pair with a new code** while still paired. The link opens the
+  pairing code field without dropping the current pairing; a successful
+  pair replaces it, and Cancel re-pair closes the field again.
+- **Pairing throttle countdown.** When OverManager refuses pairing after too
+  many wrong codes (HTTP 429), the Pair button is disabled and an amber
+  "Too many attempts. Try again in 0:47" line counts down to when you can
+  try again.
 
 ### Changed
 - **Pool URL typos are tidied before checking.** Surrounding spaces are
@@ -63,6 +74,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   and the wallet no longer appears in release logcat.
 
 ### Fixed
+- **Pairing state updates live.** When OverManager deletes the device, the
+  phone's next report drops the credentials, but the card kept saying
+  "Paired" and hid the code field until you edited a setting and saved. It
+  now shows "Pairing required" and the code field as soon as that happens.
+- **A wrong pairing code says so.** OverManager's "Invalid pairing code" now
+  shows "Wrong pairing code. Check the code in OverManager." instead of
+  claiming the code expired. A failed code while re-pairing no longer stops
+  reporting under the existing pairing.
 - **Saving Settings while mining applies to the running session.** A new
   thread count used to do nothing until Stop / Start, and the dashboard
   then showed e.g. `4/6` as if the phone were throttling. It now takes
