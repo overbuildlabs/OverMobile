@@ -85,11 +85,6 @@ crash — see `app/build.gradle.kts`) and `-assumenosideeffects` for
 `android.util.Log.d/v/i`, or route logging through a `BuildConfig.DEBUG`
 wrapper. Check the share/job SHARE_DEBUG native logs too.
 
-### R11 · P2 · Clamp remote thread counts to the engine maximum
-`set_config`/`set_threads` accept 1–16; the native engine runs at most 8 and
-the UI then shows the requested number. Clamp to
-`min(cores, 8)` and report the clamped value.
-
 ### R12 · P2 · Small lifecycle cleanups
 Thermal diagnostics read sysfs on the main thread (move to IO);
 `PoPManagerReporter.scope` is never cancelled (cancel in `MiningService.onDestroy`).
@@ -106,14 +101,6 @@ nothing keys off it); release asset name `overmobile-vX.Y.Z.apk` everywhere
 (`docs/RELEASING.md`, README; the v1.2.0 asset was named `overminer-…`);
 notification channel display name "KAS Mining" → "Mining" (keep the channel
 id). Never touch the invariants in `CLAUDE.md`.
-
-### R15 · P2 · Settings edits and the running session
-Changing threads in Settings while mining has no effect until Stop/Start,
-and the dashboard then shows e.g. `4/6`, which reads as throttling. Unsaved
-Settings edits are silently replaced by the saved values about 1 s after
-leaving the screen (the prefs poll in `MainActivity.MinerDashboard`). Apply a
-saved thread count to the live session (as `set_threads` does) and either
-auto-save or warn about unsaved changes.
 
 ### R16 · P2 · Notification says "Idle" while connecting or paused
 `MiningService.ensureRunningForReporting` checks `miningEngine.isRunning`;
@@ -234,6 +221,12 @@ together with R2; re-check the Compose + R8 crash noted in `build.gradle.kts`.
 
 ## Done
 
+- R15 (settings edits and the running session) plus R11 (thread-count
+  clamp): Settings Save applies threads to the live session within thermal
+  limits and reconnects for a new pool / wallet / worker, through the same
+  `MiningService.applyMinerConfig` path as `set_config` / `set_threads`;
+  every thread count is clamped to `min(cores, 8)`; the THREADS tile shows
+  the live session — PR TBD, branch `claude/r15-settings-live-session`.
 - Oct 21 2026 review bug batch: R5 (battery pause resumes while charging)
   plus unplugged-pause flapping, dashboard temperature colours, accepted-share
   count, pool authorization errors, Back button — branch

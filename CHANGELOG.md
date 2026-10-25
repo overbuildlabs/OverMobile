@@ -63,6 +63,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   and the wallet no longer appears in release logcat.
 
 ### Fixed
+- **Saving Settings while mining applies to the running session.** A new
+  thread count used to do nothing until Stop / Start, and the dashboard
+  then showed e.g. `4/6` as if the phone were throttling. It now takes
+  effect within a second, the same way OverManager's thread command does.
+  Thermal protection still wins: while throttled, a lower count applies at
+  once and a higher one waits for the normal cool-down restore. A new pool,
+  wallet or worker reconnects the session ("Reconnecting with the new pool
+  settings") instead of being ignored until the next Start.
+- **Thread counts are capped at what the phone can run.** Counts from
+  OverManager (which accepts up to 16) are clamped to the number of cores,
+  at most 8 (the miner's limit), and the clamped value is what the app and
+  OverManager show.
+- **A clean Settings screen keeps up with remote changes.** If OverManager
+  changed a setting while Settings was open with nothing edited, a later
+  Save wrote the old value back. Unsaved edits are still never replaced.
 - **Protection options now go through Save / Cancel.** Thermal and power
   settings (thermal protection, warn / throttle / pause / resume
   temperatures, external power mode, require charging, battery cutoff) used
