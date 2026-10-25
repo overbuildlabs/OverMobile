@@ -14,7 +14,7 @@ class MiningEngine {
         /** Sentinel string in every log line from this class. Bump whenever we
          *  push new diagnostic code so we can `adb logcat | grep BUILD_MARKER`
          *  and be sure the device has the latest native+kotlin. */
-        const val BUILD_MARKER = "BUILD_MARKER_2026-10-21-hardening"
+        const val BUILD_MARKER = "BUILD_MARKER_2026-10-25-set-threads"
 
         init {
             System.loadLibrary("popmobile")
@@ -60,6 +60,28 @@ class MiningEngine {
     fun stop() {
         Log.i(TAG, "Stopping mining")
         nativeStop()
+    }
+
+    /** Change the thread count of a running engine without restarting it:
+     *  only the workers restart, so the current job, hash counters and the
+     *  windowed hashrate carry over (a stop()+start() wiped the hashrate
+     *  history, showing 0 H/s for seconds after every throttle step).
+     *  Returns false, doing nothing, when the engine isn't running — e.g. a
+     *  Stop got in first — so callers never bring a stopped engine back. */
+    @Synchronized
+    fun setThreads(numThreads: Int): Boolean {
+        Log.i(TAG, "Setting mining threads to $numThreads")
+        return try {
+            nativeSetThreads(numThreads) > 0
+        } catch (e: LinkageError) {
+            // Stale .so without the native: fall back to the old restart.
+            // Holding the lock, no stop() can slip in between.
+            warnLinkage("nativeSetThreads", e)
+            if (!nativeIsRunning()) return false
+            nativeStop()
+            nativeStart(numThreads)
+            nativeIsRunning()
+        }
     }
 
     /** Zero accepted/rejected share counts. Call when the user starts a new
@@ -130,6 +152,7 @@ class MiningEngine {
     /* Native methods */
     private external fun nativeStart(numThreads: Int)
     private external fun nativeStop()
+    private external fun nativeSetThreads(numThreads: Int): Int
     private external fun nativeIsRunning(): Boolean
     private external fun nativeSetJob(headerHash: ByteArray, jobId: String, target: ByteArray, timestamp: Long)
     private external fun nativeGetHashrate(): Double

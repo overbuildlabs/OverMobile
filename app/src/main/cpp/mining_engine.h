@@ -26,6 +26,15 @@ void mining_start(int num_threads);
 void mining_stop(void);
 
 /**
+ * Change the worker thread count of a running engine without stopping it:
+ * only the workers restart; the current job, hash counters and hashrate
+ * history carry over. Clamped like mining_start.
+ * @return threads now running, or -1 if the engine wasn't running (or no
+ *         worker could be restarted, in which case it is now stopped).
+ */
+int mining_set_threads(int num_threads);
+
+/**
  * Check if mining is currently active.
  */
 bool mining_is_running(void);

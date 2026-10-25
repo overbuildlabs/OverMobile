@@ -63,6 +63,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   and the wallet no longer appears in release logcat.
 
 ### Fixed
+- **Changing the thread count no longer restarts the miner.** A thermal
+  throttle, the restore after cooling, a new thread count from Settings or
+  OverManager each used to stop and restart mining, so the hashrate dropped
+  to 0 for a few seconds every time. Now only the worker threads change:
+  mining carries on with the current job and the hashrate keeps reading
+  normally.
 - **Throttled threads come back once the phone cools.** After a thermal
   throttle, full threads were only restored if the temperature stayed at or
   under the resume temperature for 30 s straight. Normal sensor jitter of

@@ -106,7 +106,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
      *  instead of on the next 3 s tick. */
     private val statsWake = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
     /** The thread ceiling the running session has applied. Lags
-     *  [threadCount] only while [statsUpdateLoop] restarts the engine for a
+     *  [threadCount] only while [statsUpdateLoop] switches the engine to a
      *  new count, so the dashboard's active/ceiling tile never shows a
      *  throttle-looking `4/6` that is really a pending settings change. */
     @Volatile var sessionThreadCeiling: Int = 2
@@ -147,8 +147,8 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
      *  stats-update loop owns all start/stop transitions after the initial
      *  start; flipping this flag false on Stop / disconnect is what lets
      *  onNewJob start mining the very first time, and prevents it from
-     *  racing the stats loop's stop+restart pattern (throttle / cooldown
-     *  resume) by trying to bring the engine back up at full thread count. */
+     *  racing the stats loop's pause / resume by trying to bring the
+     *  engine back up at full thread count. */
     @Volatile private var engineStartedOnce: Boolean = false
     /** True while the onDisconnected retry-loop coroutine is active. Guards
      *  against re-entrancy — StratumClient.connect() calls onDisconnected on
@@ -798,12 +798,9 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                     val throttled = activeThreads < sessionThreadCeiling
                     val target = if (throttled) minOf(activeThreads, ceiling) else ceiling
                     if (target != activeThreads) {
-                        Log.i(TAG, "Thread ceiling $sessionThreadCeiling → $ceiling: restarting engine with $target (was $activeThreads)")
-                        miningEngine.stop()
+                        Log.i(TAG, "Thread ceiling $sessionThreadCeiling → $ceiling: switching engine to $target threads (was $activeThreads)")
+                        if (changeThreads(target)) onStatsUpdate?.invoke()
                         if (!isSessionActive) return
-                        miningEngine.start(target)
-                        activeThreads = target
-                        onStatsUpdate?.invoke()
                     }
                 }
                 sessionThreadCeiling = ceiling
@@ -855,15 +852,8 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                     val recommended = maxOf(1, threadCount / 2)
                     if (miningEngine.isRunning && recommended < activeThreads) {
                         Log.w(TAG, "THERMAL THROTTLE (${cpuTemp}°C) — reducing to $recommended threads")
-                        activeThreads = recommended
-                        miningEngine.stop()
-                        // nativeStop blocks until the worker threads exit,
-                        // which can take seconds. If the user pressed Stop
-                        // during that window, isSessionActive flipped false
-                        // and we must NOT call start() again — otherwise the
-                        // miner "fires back up" right after the user stopped.
+                        changeThreads(recommended)
                         if (!isSessionActive) return
-                        miningEngine.start(recommended)
                         onThermalWarning?.invoke(thermalState, cpuTemp)
                     }
                 }
@@ -876,10 +866,8 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                         val step = stepCoolingHold(heat, "before restoring $threadCount threads (now $activeThreads)")
                         if (step == ResumeHold.Step.READY) {
                             Log.i(TAG, "Restoring thread count $activeThreads → $threadCount (${cpuTemp}°C)")
-                            miningEngine.stop()
+                            changeThreads(threadCount)
                             if (!isSessionActive) return
-                            miningEngine.start(threadCount)
-                            activeThreads = threadCount
                             coolingSince = 0L
                             updateProtectionBanner(lastDeviceStatus)
                             onStatsUpdate?.invoke()
@@ -898,6 +886,17 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
             withTimeoutOrNull(3000) { statsWake.receive() }
         }
         Log.i(TAG, "statsUpdateLoop EXITED (session=$isSessionActive)")
+    }
+
+    /** Switches the running engine to [threads] without a stop/start, so the
+     *  job and windowed hashrate carry over (throttle, restore, a new
+     *  ceiling). Never starts a stopped engine: if a user Stop got in first
+     *  the engine stays stopped, and activeThreads is left to stopMining.
+     *  Returns true when the engine now runs [threads]. */
+    private fun changeThreads(threads: Int): Boolean {
+        val ok = miningEngine.setThreads(threads)
+        if (ok && isSessionActive) activeThreads = threads
+        return ok
     }
 
     /** Advances the cool-down hold one tick and logs only its transitions
