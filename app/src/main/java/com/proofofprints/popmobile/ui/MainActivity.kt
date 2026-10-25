@@ -1012,14 +1012,37 @@ class MainActivity : ComponentActivity() {
         var popPairingCode by remember { mutableStateOf("") }
         var popPairResult by remember { mutableStateOf<String?>(null) }
         var popPairing by remember { mutableStateOf(false) }
+        // "Re-pair" opens the code field while still paired.
+        var popRepairOpen by remember { mutableStateOf(false) }
+        var showUnpairDialog by remember { mutableStateOf(false) }
+        // Wall-clock end of an OverManager pairing throttle (HTTP 429); 0 = none.
+        var popThrottleUntil by remember { mutableStateOf(0L) }
+        var popThrottleLeft by remember { mutableStateOf(0) }
         val scope = rememberCoroutineScope()
 
-        // Live pairing status from the reporter (polled once per second via
-        // the same LaunchedEffect that updates mining stats). We read directly
-        // each recomposition because the flags are @Volatile on the reporter.
-        val popPairingRequired = miningService?.popManagerReporter?.pairingRequired ?: false
-        val popLastStatus = miningService?.popManagerReporter?.lastStatus ?: "idle"
-        val popLastError = miningService?.popManagerReporter?.lastError
+        LaunchedEffect(popThrottleUntil) {
+            while (popThrottleUntil > 0L) {
+                val left = ((popThrottleUntil - System.currentTimeMillis() + 999) / 1000).toInt()
+                if (left <= 0) {
+                    popThrottleUntil = 0L
+                    popThrottleLeft = 0
+                    break
+                }
+                popThrottleLeft = left
+                delay(1000)
+            }
+        }
+
+        // Live pairing status from the reporter's StateFlow, so the card
+        // flips to "Pairing required" the moment the credentials are cleared
+        // (OverManager deleted the device, or Remove pairing) instead of on
+        // the next unrelated recomposition.
+        val popState = miningService?.popManagerReporter?.state?.collectAsState()?.value
+        val popPairingRequired = popState?.pairingRequired ?: false
+        val popLastStatus = popState?.status ?: "idle"
+        val popLastError = popState?.error
+        val hasStoredKey = popState?.hasCredentials
+            ?: (popPrefs.getString("api_key", null) != null)
 
         Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
 
@@ -1158,7 +1181,6 @@ class MainActivity : ComponentActivity() {
                     )
 
                     // --- Pairing status banner ---
-                    val hasStoredKey = popPrefs.getString("api_key", null) != null
                     val (bannerText, bannerColor) = when {
                         popServerUrl.isBlank() ->
                             "Not configured" to Color.Gray
@@ -1219,7 +1241,7 @@ class MainActivity : ComponentActivity() {
                     // --- Pairing code row (only shown when pairing is required
                     //     OR user wants to re-pair) ---
                     val showPairingInput = popPairingRequired || !hasStoredKey ||
-                        popPairingCode.isNotEmpty()
+                        popPairingCode.isNotEmpty() || popRepairOpen
                     if (showPairingInput) {
                         OutlinedTextField(
                             value = popPairingCode,
@@ -1304,12 +1326,23 @@ class MainActivity : ComponentActivity() {
                                 popPairResult = null
                                 scope.launch {
                                     val result = svc.popManagerReporter.pairWithCode(popPairingCode)
-                                    popPairResult = result.fold(
-                                        onSuccess = { "Paired successfully" },
-                                        onFailure = { "Failed: ${it.message}" }
-                                    )
+                                    val err = result.exceptionOrNull()
+                                    if (err is com.proofofprints.popmobile.popmanager
+                                            .PoPManagerReporter.PairingThrottledException) {
+                                        // The countdown line replaces the error text.
+                                        popPairResult = null
+                                        popThrottleLeft = err.retryAfterSeconds
+                                        popThrottleUntil = System.currentTimeMillis() +
+                                            err.retryAfterSeconds * 1000L
+                                    } else {
+                                        popPairResult = result.fold(
+                                            onSuccess = { "Paired successfully" },
+                                            onFailure = { "Failed: ${it.message}" }
+                                        )
+                                    }
                                     if (result.isSuccess) {
                                         popPairingCode = ""
+                                        popRepairOpen = false
                                         // Persist the server URL + name alongside
                                         popPrefs.edit()
                                             .putString("server_url", popServerUrl.trimEnd('/'))
@@ -1330,6 +1363,7 @@ class MainActivity : ComponentActivity() {
                             },
                             modifier = Modifier.weight(1f),
                             enabled = !popPairing &&
+                                popThrottleLeft == 0 &&
                                 popPairingCode.length == 6 &&
                                 popServerUrl.isNotBlank(),
                             colors = ButtonDefaults.buttonColors(
@@ -1339,7 +1373,8 @@ class MainActivity : ComponentActivity() {
                         ) {
                             Text(
                                 if (popPairing) "Pairing..." else "Pair",
-                                color = if (popPairing || popPairingCode.length != 6)
+                                color = if (popPairing || popThrottleLeft > 0 ||
+                                    popPairingCode.length != 6)
                                     Color.Gray else Color.Black,
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
@@ -1364,8 +1399,101 @@ class MainActivity : ComponentActivity() {
                             fontFamily = FontFamily.Monospace
                         )
                     }
+                    if (popThrottleLeft > 0) {
+                        Text(
+                            "Too many attempts. Try again in " +
+                                "${popThrottleLeft / 60}:${(popThrottleLeft % 60).toString().padStart(2, '0')}",
+                            color = Color(0xFFFBBF24),
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+
+                    // --- Paired: re-pair / remove pairing ---
+                    if (hasStoredKey) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (popRepairOpen || popPairingCode.isNotEmpty()) {
+                                TextButton(onClick = {
+                                    popRepairOpen = false
+                                    popPairingCode = ""
+                                    popPairResult = null
+                                }) {
+                                    Text("Cancel re-pair", color = Color.Gray,
+                                        fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                                }
+                            } else {
+                                TextButton(onClick = {
+                                    popRepairOpen = true
+                                    popPairResult = null
+                                }) {
+                                    Text("Re-pair with a new code", color = Color(0xFF10B981),
+                                        fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                                }
+                            }
+                            OutlinedButton(
+                                onClick = { showUnpairDialog = true },
+                                enabled = !popPairing,
+                                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFFF4444))
+                            ) {
+                                Text("Remove pairing", color = Color(0xFFFF4444),
+                                    fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace)
+                            }
+                        }
+                    }
                 }
             }
+        }
+
+        if (showUnpairDialog) {
+            AlertDialog(
+                onDismissRequest = { showUnpairDialog = false },
+                title = {
+                    Text(
+                        "Remove pairing?",
+                        color = Color(0xFFFF4444),
+                        fontFamily = FontFamily.Monospace
+                    )
+                },
+                text = {
+                    Text(
+                        "This phone stops reporting to OverManager and won't take " +
+                            "its commands until you pair again. Mining keeps running.",
+                        color = Color.White,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showUnpairDialog = false
+                        miningService?.popManagerReporter?.unpair() ?: run {
+                            // Service not bound: clear the stored key directly;
+                            // the reporter re-reads prefs when it next starts.
+                            popPrefs.edit()
+                                .remove("api_key")
+                                .remove("report_url")
+                                .remove("creds_server_url")
+                                .apply()
+                        }
+                        popRepairOpen = false
+                        popPairingCode = ""
+                        popPairResult = null
+                    }) {
+                        Text("REMOVE", color = Color(0xFFFF4444), fontFamily = FontFamily.Monospace)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showUnpairDialog = false }) {
+                        Text("Cancel", color = Color.Gray, fontFamily = FontFamily.Monospace)
+                    }
+                },
+                containerColor = Color(0xFF16161B)
+            )
         }
     }
 
