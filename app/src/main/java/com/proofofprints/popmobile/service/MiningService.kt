@@ -39,6 +39,26 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
 
         /** Wake-lock timeout; statsUpdateLoop re-acquires at half of it. */
         private const val WAKE_LOCK_TIMEOUT_MS = 4 * 60 * 60 * 1000L
+
+        /** MAX_THREADS in mining_engine.c; mining_start silently caps there. */
+        private const val ENGINE_MAX_THREADS = 8
+
+        /** Most worker threads this device can usefully run: one per core,
+         *  never more than the native engine starts. The Settings slider and
+         *  every remote thread command use this same limit. */
+        fun maxThreads(): Int =
+            Runtime.getRuntime().availableProcessors().coerceIn(1, ENGINE_MAX_THREADS)
+
+        fun clampThreads(requested: Int): Int = requested.coerceIn(1, maxThreads())
+
+        /** "stratum+tcp://host:port" (scheme optional) to host and port, or
+         *  null when it doesn't have that shape. */
+        fun parsePoolUrl(url: String): Pair<String, Int>? {
+            val parts = url.trim().replace("stratum+tcp://", "").trimEnd('/').split(":")
+            if (parts.size != 2 || parts[0].isEmpty()) return null
+            val port = parts[1].toIntOrNull() ?: return null
+            return parts[0] to port
+        }
     }
 
     inner class MiningBinder : Binder() {
@@ -74,7 +94,20 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
     var poolPort: Int = 0
     var walletAddress: String = ""
     var workerName: String = "OverMobile"
-    var threadCount: Int = 2
+    /** The configured thread count: the ceiling for the session. Thermal
+     *  throttling runs fewer ([activeThreads]); a change while mining is
+     *  applied by [statsUpdateLoop], which owns engine restarts. Written from
+     *  the UI and the reporter's IO thread, read by the stats loop. */
+    @Volatile var threadCount: Int = 2
+    /** Wakes [statsUpdateLoop] early so a new thread count applies at once
+     *  instead of on the next 3 s tick. */
+    private val statsWake = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
+    /** The thread ceiling the running session has applied. Lags
+     *  [threadCount] only while [statsUpdateLoop] restarts the engine for a
+     *  new count, so the dashboard's active/ceiling tile never shows a
+     *  throttle-looking `4/6` that is really a pending settings change. */
+    @Volatile var sessionThreadCeiling: Int = 2
+        private set
     var currentDifficulty: Double = 0.0014  // Reasonable starting diff for ~40 KH/s phone
 
     // Thermal state exposed to UI. @Volatile because these are written by
@@ -213,7 +246,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         }
         walletAddress = prefs.getString("wallet", "") ?: ""
         workerName = prefs.getString("worker", "OverMobile") ?: "OverMobile"
-        threadCount = prefs.getInt("threads", 2)
+        threadCount = clampThreads(prefs.getInt("threads", 2))
 
         // Start the reporter immediately — it runs independently of mining so
         // OverManager sees the device even when stopped/paused.
@@ -333,10 +366,6 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
     }
 
     private fun handleSetConfig(params: com.google.gson.JsonObject): String? {
-        val prefs = getSharedPreferences("kas_miner", Context.MODE_PRIVATE).edit()
-        var changedPool = false
-        var changedThreads = false
-
         // Validate every field before changing anything: these values arrive
         // over the network from OverManager, so apply the same checks the
         // Settings screen does (and refuse a half-applied config).
@@ -348,62 +377,25 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         newWorker?.let { FieldValidators.validateWorkerName(it)?.let { e -> return "invalid worker: $e" } }
         val newThreads = params.get("threads")?.takeIf { !it.isJsonNull }?.asInt
         if (newThreads != null && newThreads !in 1..16) return "threads out of range: $newThreads"
+        if (newPoolUrl != null && parsePoolUrl(newPoolUrl) == null) return "invalid poolUrl: $newPoolUrl"
 
-        newPoolUrl?.let { url ->
-            val cleaned = url.replace("stratum+tcp://", "").trimEnd('/')
-            val parts = cleaned.split(":")
-            if (parts.size != 2) return "invalid poolUrl: $url"
-            val newHost = parts[0]
-            val newPort = parts[1].toIntOrNull() ?: return "invalid port in poolUrl: $url"
-            if (newHost != poolHost || newPort != poolPort) {
-                poolHost = newHost
-                poolPort = newPort
-                changedPool = true
-            }
-            prefs.putString("pool_url", url)
+        if (newWallet != null && newWallet != walletAddress) {
+            // Payout address changed remotely — make it visible on the
+            // device, not only in logcat.
+            LogManager.warn("OverManager changed the payout wallet to ${newWallet.take(14)}…${newWallet.takeLast(6)}")
         }
-        newWallet?.let { wallet ->
-            if (wallet != walletAddress) {
-                // Payout address changed remotely — make it visible on the
-                // device, not only in logcat.
-                LogManager.warn("OverManager changed the payout wallet to ${wallet.take(14)}…${wallet.takeLast(6)}")
-                walletAddress = wallet
-                changedPool = true
-            }
-            prefs.putString("wallet", wallet)
-        }
-        newWorker?.let { w ->
-            if (w != workerName) {
-                workerName = w
-                changedPool = true
-            }
-            prefs.putString("worker", w)
-        }
-        newThreads?.let { t ->
-            if (t != threadCount) {
-                threadCount = t
-                changedThreads = true
-            }
-            prefs.putInt("threads", t)
-        }
+        val applied = applyMinerConfig(newPoolUrl, newWallet, newWorker, newThreads)
+
+        val prefs = getSharedPreferences("kas_miner", Context.MODE_PRIVATE).edit()
+        newPoolUrl?.let { prefs.putString("pool_url", it) }
+        newWallet?.let { prefs.putString("wallet", it) }
+        newWorker?.let { prefs.putString("worker", it) }
+        // Store the clamped count so the UI and telemetry show what runs.
+        if (newThreads != null) prefs.putInt("threads", applied.threads)
         prefs.apply()
 
         // Notify UI to refresh fields
         onStatsUpdate?.invoke()
-
-        // If currently mining and the pool-side config changed, restart the
-        // stratum connection + worker threads to pick up the new values.
-        if (isSessionActive && changedPool) {
-            Log.i(TAG, "set_config: restarting mining to apply new pool/wallet/worker")
-            restartMiningInternal()
-        } else if (miningEngine.isRunning && changedThreads) {
-            // Threads-only change: reuse thermal restart path
-            Log.i(TAG, "set_config: adjusting thread count to $threadCount")
-            miningEngine.stop()
-            miningEngine.start(threadCount)
-            activeThreads = threadCount
-        }
-
         return null
     }
 
@@ -412,18 +404,71 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
             ?: return "missing threads param"
         if (threads < 1 || threads > 16) return "threads out of range: $threads"
 
-        threadCount = threads
+        val applied = applyMinerConfig(threads = threads)
         getSharedPreferences("kas_miner", Context.MODE_PRIVATE)
-            .edit().putInt("threads", threads).apply()
+            .edit().putInt("threads", applied.threads).apply()
         onStatsUpdate?.invoke()
-
-        if (miningEngine.isRunning) {
-            Log.i(TAG, "set_threads: restarting engine with $threads threads")
-            miningEngine.stop()
-            miningEngine.start(threads)
-            activeThreads = threads
-        }
         return null
+    }
+
+    /** What [applyMinerConfig] did. [threads] is the clamped ceiling now in
+     *  force; [reconnecting] is true when the live session is reconnecting
+     *  to pick up a new pool, wallet or worker. */
+    data class AppliedConfig(val threads: Int, val reconnecting: Boolean)
+
+    /**
+     * Applies miner settings to the service and, if a session is active, to
+     * the live session. The one path for OverManager's `set_config` /
+     * `set_threads` and the Settings screen's Save. Null or blank fields are
+     * left as they are. Callers validate first and persist to prefs.
+     *
+     * - Threads are clamped to [maxThreads] and become the new ceiling.
+     *   [statsUpdateLoop] applies it (woken at once): straight away when
+     *   running at the full count; under a thermal throttle it only ever
+     *   lowers the active count, and raising waits for the normal cool-down
+     *   restore; a paused session resumes at the new ceiling.
+     * - A changed pool, wallet or worker reconnects the session, as a remote
+     *   `set_config` always has; the engine restarts on the new pool's first
+     *   job.
+     */
+    fun applyMinerConfig(
+        poolUrl: String? = null,
+        wallet: String? = null,
+        worker: String? = null,
+        threads: Int? = null
+    ): AppliedConfig {
+        var changedPool = false
+        poolUrl?.takeIf { it.isNotBlank() }?.let { parsePoolUrl(it) }?.let { (host, port) ->
+            if (host != poolHost || port != poolPort) {
+                poolHost = host
+                poolPort = port
+                changedPool = true
+            }
+        }
+        wallet?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            if (it != walletAddress) { walletAddress = it; changedPool = true }
+        }
+        worker?.trim()?.takeIf { it.isNotEmpty() }?.let {
+            if (it != workerName) { workerName = it; changedPool = true }
+        }
+        threads?.let { requested ->
+            val t = clampThreads(requested)
+            if (t != requested) Log.i(TAG, "Thread count $requested clamped to $t (cores / engine limit)")
+            if (t != threadCount) {
+                threadCount = t
+                if (isSessionActive) {
+                    LogManager.info("Thread count set to $t")
+                    statsWake.trySend(Unit)
+                }
+            }
+        }
+        val reconnect = isSessionActive && changedPool
+        if (reconnect) {
+            Log.i(TAG, "Pool/wallet/worker changed — reconnecting the session")
+            LogManager.info("Reconnecting to apply new pool settings")
+            restartMiningInternal()
+        }
+        return AppliedConfig(threadCount, reconnect)
     }
 
     private fun handleRemoteStart(): String? {
@@ -664,6 +709,8 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         var tickCount = 0L
         var lastPerThreadHashes = LongArray(0)
         var lastPerThreadTickMs = 0L
+        // Thread ceiling this loop last acted on; see the ceiling check below.
+        sessionThreadCeiling = threadCount
         Log.i(TAG, "statsUpdateLoop ENTERED [${com.proofofprints.popmobile.mining.MiningEngine.BUILD_MARKER}] (engineRunning=${miningEngine.isRunning} paused=$thermalPaused session=$isSessionActive)")
         // Keyed on isSessionActive so the loop stays alive from pool-connect
         // (before the first job arrives and kicks off the miner) all the way
@@ -728,6 +775,31 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
             val heat = heatState
             val blocker = pauseBlocker(heat)
             val paused = pauseReason
+
+            // The configured thread count (the ceiling) changed mid-session
+            // via Settings Save or OverManager. Applied here, not by the
+            // caller, because this loop owns engine restarts. Running at the
+            // old ceiling means not throttled: switch to the new count. Already
+            // throttled below it: only ever lower (never raise past the
+            // throttle; the NORMAL branch restores to the new ceiling once
+            // cool). Paused or no job yet: resume / onNewJob read threadCount.
+            val ceiling = threadCount
+            if (ceiling != sessionThreadCeiling) {
+                if (blocker == null && paused == null && miningEngine.isRunning) {
+                    val throttled = activeThreads < sessionThreadCeiling
+                    val target = if (throttled) minOf(activeThreads, ceiling) else ceiling
+                    if (target != activeThreads) {
+                        Log.i(TAG, "Thread ceiling $sessionThreadCeiling → $ceiling: restarting engine with $target (was $activeThreads)")
+                        miningEngine.stop()
+                        if (!isSessionActive) return
+                        miningEngine.start(target)
+                        activeThreads = target
+                        onStatsUpdate?.invoke()
+                    }
+                }
+                sessionThreadCeiling = ceiling
+            }
+
             if (blocker != null) {
                 coolingSince = 0L
                 if (paused != blocker) {
@@ -818,7 +890,9 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                 ThermalMonitor.ThermalState.CRITICAL -> {}
             }
 
-            delay(3000) // Check every 3 seconds
+            // Check every 3 seconds, or sooner when applyMinerConfig changes
+            // the thread count.
+            withTimeoutOrNull(3000) { statsWake.receive() }
         }
         Log.i(TAG, "statsUpdateLoop EXITED (session=$isSessionActive)")
     }

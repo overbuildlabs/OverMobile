@@ -239,6 +239,19 @@ class MainActivity : ComponentActivity() {
             // The service and ThermalMonitor read MiningPreferences on every
             // tick, so new limits take effect without a restart.
             protection.saveTo(miningPrefs)
+            // Hand the miner fields to the service: a running session picks
+            // up a new thread count right away (within thermal limits) and
+            // reconnects for a new pool / wallet / worker, the same path as
+            // OverManager's set_config. Telemetry shows the new values too.
+            miningService?.applyMinerConfig(poolUrl, wallet, worker, threads)?.let { applied ->
+                if (applied.reconnecting) {
+                    android.widget.Toast.makeText(
+                        this@MainActivity,
+                        "Reconnecting with the new pool settings",
+                        android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
             // Restart reporter so it picks up the new server URL /
             // device name. If the URL now names a different server,
             // the reporter drops the old server's credentials and asks
@@ -352,6 +365,8 @@ class MainActivity : ComponentActivity() {
         var batteryPercent by remember { mutableIntStateOf(100) }
         var thermalState by remember { mutableStateOf("NORMAL") }
         var activeThreads by remember { mutableIntStateOf(0) }
+        // Ceiling the live session runs under (see MiningService.sessionThreadCeiling).
+        var sessionThreadCeiling by remember { mutableIntStateOf(0) }
         var difficulty by remember { mutableDoubleStateOf(0.0) }
         var protectionMessage by remember { mutableStateOf("") }
         var protectionSeverity by remember { mutableStateOf(MiningService.ProtectionSeverity.NONE) }
@@ -373,6 +388,7 @@ class MainActivity : ComponentActivity() {
                     batteryPercent = it.batteryPercent
                     thermalState = it.thermalState.name
                     activeThreads = it.activeThreads
+                    sessionThreadCeiling = it.sessionThreadCeiling
                     difficulty = it.currentDifficulty
                     protectionMessage = it.protectionMessage
                     protectionSeverity = it.protectionSeverity
@@ -380,28 +396,29 @@ class MainActivity : ComponentActivity() {
 
                 // Re-read config from prefs so remote OverManager commands
                 // (set_config / set_threads) reflect in the UI within ~1s of
-                // being applied. Only update when the stored value differs
-                // from the current state to avoid fighting user input while
-                // they're typing in the Settings panel.
+                // being applied. Never while Settings has unsaved edits (that
+                // would silently replace them); a clean Settings screen keeps
+                // mirroring, so a later Save can't write back stale values.
+                val mirrorPrefs = !isSettingsDirty()
                 // Same default as the initial value above: a fresh install has
                 // no saved pool_url, and reading "" here wiped the prefilled
                 // default a second after launch.
                 val freshPoolUrl = prefs.getString("pool_url", null)?.takeIf { it.isNotBlank() }
                     ?: DEFAULT_POOL_URL
-                if (freshPoolUrl != poolUrl && !showSettings) poolUrl = freshPoolUrl
+                if (freshPoolUrl != poolUrl && mirrorPrefs) poolUrl = freshPoolUrl
                 val freshWallet = prefs.getString("wallet", "") ?: ""
-                if (freshWallet != wallet && !showSettings) wallet = freshWallet
+                if (freshWallet != wallet && mirrorPrefs) wallet = freshWallet
                 val freshWorker = prefs.getString("worker", "OverMobile") ?: "OverMobile"
-                if (freshWorker != worker && !showSettings) worker = freshWorker
+                if (freshWorker != worker && mirrorPrefs) worker = freshWorker
                 val freshThreads = prefs.getInt("threads", 2)
-                if (freshThreads != threads && !showSettings) threads = freshThreads
-                if (!showSettings) {
+                if (freshThreads != threads && mirrorPrefs) threads = freshThreads
+                if (mirrorPrefs) {
                     popServerUrl = popPrefs.getString("server_url", "") ?: ""
                     popDeviceName = popPrefs.getString("device_name", defaultDeviceName)
                         ?: defaultDeviceName
                     protection = ProtectionSettings.load(miningPrefs)
-                    // Outside Settings the fields mirror prefs, so they are
-                    // by definition the last-saved values.
+                    // With no unsaved edits the fields mirror prefs, so they
+                    // are by definition the last-saved values.
                     savedSettings = SavedSettings(
                         poolUrl, wallet, worker, threads, popServerUrl, popDeviceName, protection
                     )
@@ -666,7 +683,9 @@ class MainActivity : ComponentActivity() {
                         )
                         StatCardCompact(
                             label = "THREADS",
-                            value = if (isRunning) "$activeThreads/$threads" else "$threads",
+                            // Live session: active/ceiling, which differ only while thermally
+                            // throttled; a just-saved count is already in the ceiling.
+                            value = if (isRunning) "$activeThreads/$sessionThreadCeiling" else "$threads",
                             color = Color(0xFFFF6B6B),
                             modifier = Modifier.weight(1f)
                         )
@@ -999,9 +1018,10 @@ class MainActivity : ComponentActivity() {
         onProtectionChange: (ProtectionSettings) -> Unit,
         onPopSettingsPersisted: () -> Unit
     ) {
-        // The native engine runs at most 8 workers (MAX_THREADS in
-        // mining_engine.c); offering more would show a count it never uses.
-        val maxThreads = Runtime.getRuntime().availableProcessors().coerceIn(1, 8)
+        // One per core, capped at the native engine's MAX_THREADS; offering
+        // more would show a count it never uses. Same limit the service
+        // clamps remote and saved counts to.
+        val maxThreads = MiningService.maxThreads()
 
         // OverManager settings. The editable fields are hoisted into
         // MinerDashboard (saved by the Save bar); pairing still writes the
