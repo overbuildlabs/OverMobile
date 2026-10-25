@@ -63,6 +63,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   and the wallet no longer appears in release logcat.
 
 ### Fixed
+- **Throttled threads come back once the phone cools.** After a thermal
+  throttle, full threads were only restored if the temperature stayed at or
+  under the resume temperature for 30 s straight. Normal sensor jitter of
+  about a degree reset that wait, so a phone hovering right at the resume
+  temperature could stay throttled for good. Small wobbles (up to 1 °C over
+  the resume temperature) no longer reset the 30 s wait; a real rise, or
+  reaching the throttle temperature, still does. The same applies to
+  resuming after a heat pause.
+- **The banner shows when you're throttled.** While running fewer threads
+  because of heat, the banner says so (e.g. "Throttled: 4/8 threads — back
+  to 8 below 68°C", then "Cooling — restoring 8 threads in 20s") instead of
+  an unrelated note such as "External power mode".
 - **Saving Settings while mining applies to the running session.** A new
   thread count used to do nothing until Stop / Start, and the dashboard
   then showed e.g. `4/6` as if the phone were throttling. It now takes

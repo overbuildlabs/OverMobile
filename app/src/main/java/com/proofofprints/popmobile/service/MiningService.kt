@@ -32,6 +32,9 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         private const val TAG = "MiningService"
         private const val NOTIFICATION_ID = 1
         private const val CHANNEL_ID = "kas_mining_channel"
+        /** Start of the cool-down countdown banner; the seconds after it
+         *  change every tick, so banner logging matches on this prefix. */
+        private const val COOLING_BANNER_PREFIX = "Cooling — restoring"
 
         const val ACTION_START = "com.proofofprints.popmobile.START"
         const val ACTION_STOP = "com.proofofprints.popmobile.STOP"
@@ -159,12 +162,15 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
      *  has already dropped, at which point the banner shows 'cooling'
      *  instead of the actual cause. */
     @Volatile private var lastDeviceStatus: ThermalMonitor.DeviceStatus? = null
-    /** Monotonic-ms timestamp of when displayTemp first dipped below the
-     *  resume threshold after a pause. Used to hold off resuming until the
-     *  drop has been sustained for [RESUME_HOLD_MS], preventing thrash. */
-    private var coolingSince: Long = 0L
-    /** How long the temperature must stay below resumeTempC before we'll
-     *  bring mining back up from a thermal pause. */
+    /** Wall-clock ms when the current cool-down hold started (0 = none):
+     *  after a thermal pause, or while throttled below the ceiling. Mining
+     *  resumes / threads are restored once the hold has lasted
+     *  [RESUME_HOLD_MS] (see [ResumeHold]). Written by the stats loop, read
+     *  by the poller for the banner countdown. */
+    @Volatile private var coolingSince: Long = 0L
+    /** How long the temperature must stay at or near resumeTempC before we
+     *  bring mining back up from a thermal pause or restore throttled
+     *  threads. */
     private val RESUME_HOLD_MS = 30_000L
     /** A battery pause resumes only above cutoff + this many percent, so the
      *  miner doesn't flap at the cutoff while charging. */
@@ -301,6 +307,9 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         protectionMessage = newMessage
         protectionSeverity = newSeverity
         if (newMessage.isEmpty() && oldMessage.isEmpty()) return
+        // The cooling countdown changes every tick; log it once per hold.
+        if (newMessage.startsWith(COOLING_BANNER_PREFIX) &&
+            oldMessage.startsWith(COOLING_BANNER_PREFIX)) return
         val transition = if (newMessage.isEmpty()) "cleared ($oldMessage)" else newMessage
         Log.i(TAG, "PROTECTION $transition")
         if (newMessage != lastLoggedProtectionMessage) {
@@ -801,7 +810,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
             }
 
             if (blocker != null) {
-                coolingSince = 0L
+                cancelCoolingHold()
                 if (paused != blocker) {
                     pauseReason = blocker
                     updateProtectionBanner(lastDeviceStatus)
@@ -821,16 +830,10 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                     if (blocker == PauseReason.HEAT) onThermalWarning?.invoke(thermalState, cpuTemp)
                 }
             } else if (paused != null) {
-                val nowMs = System.currentTimeMillis()
-                val ready = when {
-                    paused != PauseReason.HEAT -> true
-                    coolingSince == 0L -> {
-                        coolingSince = nowMs
-                        Log.i(TAG, "Cooling observed (${cpuTemp}°C ≤ ${preferences.resumeTempC}°C) — holding for ${RESUME_HOLD_MS / 1000}s before resume")
-                        false
-                    }
-                    else -> nowMs - coolingSince >= RESUME_HOLD_MS
-                }
+                // pauseBlocker already kept a HEAT pause while the hold
+                // couldn't start or was cancelled, so here it starts or runs.
+                val ready = paused != PauseReason.HEAT ||
+                    stepCoolingHold(heat, "before resume") == ResumeHold.Step.READY
                 if (ready) {
                     if (!isSessionActive) return
                     Log.i(TAG, "Pause ($paused) cleared — resuming mining (${cpuTemp}°C, battery $batteryPercent%)")
@@ -848,7 +851,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                 }
             } else when (heat) {
                 ThermalMonitor.ThermalState.THROTTLE -> {
-                    coolingSince = 0L
+                    cancelCoolingHold()
                     val recommended = maxOf(1, threadCount / 2)
                     if (miningEngine.isRunning && recommended < activeThreads) {
                         Log.w(TAG, "THERMAL THROTTLE (${cpuTemp}°C) — reducing to $recommended threads")
@@ -864,27 +867,27 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                         onThermalWarning?.invoke(thermalState, cpuTemp)
                     }
                 }
-                ThermalMonitor.ThermalState.NORMAL -> {
-                    if (miningEngine.isRunning && activeThreads < threadCount && isCoolEnough()) {
-                        val nowMs = System.currentTimeMillis()
-                        if (coolingSince == 0L) {
-                            coolingSince = nowMs
-                            Log.i(TAG, "Cool enough to un-throttle (${cpuTemp}°C ≤ ${preferences.resumeTempC}°C, currently $activeThreads/$threadCount) — holding for ${RESUME_HOLD_MS / 1000}s")
-                        } else if (nowMs - coolingSince >= RESUME_HOLD_MS) {
+                ThermalMonitor.ThermalState.NORMAL,
+                ThermalMonitor.ThermalState.WARNING -> {
+                    if (heat == ThermalMonitor.ThermalState.WARNING) {
+                        onThermalWarning?.invoke(thermalState, cpuTemp)
+                    }
+                    if (miningEngine.isRunning && activeThreads < threadCount) {
+                        val step = stepCoolingHold(heat, "before restoring $threadCount threads (now $activeThreads)")
+                        if (step == ResumeHold.Step.READY) {
                             Log.i(TAG, "Restoring thread count $activeThreads → $threadCount (${cpuTemp}°C)")
                             miningEngine.stop()
                             if (!isSessionActive) return
                             miningEngine.start(threadCount)
                             activeThreads = threadCount
                             coolingSince = 0L
+                            updateProtectionBanner(lastDeviceStatus)
+                            onStatsUpdate?.invoke()
                         }
                     } else {
+                        // Not throttled (e.g. a lowered ceiling): nothing to hold.
                         coolingSince = 0L
                     }
-                }
-                ThermalMonitor.ThermalState.WARNING -> {
-                    coolingSince = 0L
-                    onThermalWarning?.invoke(thermalState, cpuTemp)
                 }
                 // CRITICAL heat is always a blocker, handled above.
                 ThermalMonitor.ThermalState.CRITICAL -> {}
@@ -897,9 +900,33 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         Log.i(TAG, "statsUpdateLoop EXITED (session=$isSessionActive)")
     }
 
-    /** Devices with no readable sysfs zone (cpuTemp == 0) rely on the OS
-     *  thermal signal; NORMAL from it is cool enough. */
-    private fun isCoolEnough(): Boolean = cpuTemp <= 0f || cpuTemp <= preferences.resumeTempC
+    /** Advances the cool-down hold one tick and logs only its transitions
+     *  (start / cancel), not every tick. [what] finishes the start message. */
+    private fun stepCoolingHold(heat: ThermalMonitor.ThermalState, what: String): ResumeHold.Step {
+        val nowMs = System.currentTimeMillis()
+        val resumeC = preferences.resumeTempC
+        val step = ResumeHold.step(coolingSince, nowMs, RESUME_HOLD_MS, cpuTemp, resumeC, heat)
+        when (step) {
+            ResumeHold.Step.START -> {
+                coolingSince = nowMs
+                Log.i(TAG, "Cooling hold started (${cpuTemp}°C ≤ ${resumeC}°C) — holding ${RESUME_HOLD_MS / 1000}s $what")
+                updateProtectionBanner(lastDeviceStatus)
+            }
+            ResumeHold.Step.CANCEL -> cancelCoolingHold()
+            else -> {}
+        }
+        return step
+    }
+
+    /** Drops an active cool-down hold, logging why. No-op when not holding. */
+    private fun cancelCoolingHold() {
+        if (coolingSince == 0L) return
+        val heldS = (System.currentTimeMillis() - coolingSince) / 1000
+        coolingSince = 0L
+        Log.i(TAG, "Cooling hold cancelled after ${heldS}s (${cpuTemp}°C, ${heatState.name}; " +
+            "limit ${preferences.resumeTempC + ResumeHold.TOLERANCE_C}°C)")
+        updateProtectionBanner(lastDeviceStatus)
+    }
 
     /** The condition that should keep (or put) the engine paused right now,
      *  or null when mining may run. Order matches the banner's priority. */
@@ -915,8 +942,11 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
             !preferences.externalPowerMode && preferences.requireCharging && !isCharging ->
                 PauseReason.UNPLUGGED
             heat == ThermalMonitor.ThermalState.CRITICAL -> PauseReason.HEAT
+            // Stay paused until the cool-down hold can start, and while it
+            // runs only if it's cancelled (see ResumeHold's tolerance).
             current == PauseReason.HEAT &&
-                (heat != ThermalMonitor.ThermalState.NORMAL || !isCoolEnough()) -> PauseReason.HEAT
+                !ResumeHold.conditionsMet(coolingSince != 0L, cpuTemp, preferences.resumeTempC, heat) ->
+                PauseReason.HEAT
             else -> null
         }
     }
@@ -1166,6 +1196,24 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         // "we just hit the limit" alert.
         if (status?.heatState == ThermalMonitor.ThermalState.CRITICAL) {
             return ProtectionSeverity.CRITICAL to "Critical temp ($tStr) — pausing"
+        }
+        // Thermally throttled: running fewer threads than the session's
+        // ceiling. Takes precedence over Warm / config notices so the user can
+        // see why the hashrate dropped and when it comes back. Compared with
+        // sessionThreadCeiling, not threadCount, so a Settings change the
+        // stats loop hasn't applied yet isn't shown as a throttle (and a
+        // user-lowered ceiling never is).
+        val ceiling = sessionThreadCeiling
+        val active = activeThreads
+        if (miningEngine.isRunning && active in 1 until ceiling) {
+            val since = coolingSince
+            if (since != 0L) {
+                val leftMs = (RESUME_HOLD_MS - (System.currentTimeMillis() - since)).coerceAtLeast(0L)
+                val leftS = (leftMs + 500L) / 1000L
+                return ProtectionSeverity.WARNING to "$COOLING_BANNER_PREFIX $ceiling threads in ${leftS}s"
+            }
+            val until = if (t > 0f) "below ${preferences.resumeTempC.toInt()}°C" else "when cool"
+            return ProtectionSeverity.WARNING to "Throttled: $active/$ceiling threads — back to $ceiling $until"
         }
         if (miningEngine.isRunning && status?.heatState == ThermalMonitor.ThermalState.THROTTLE) {
             val active = miningEngine.activeThreads
