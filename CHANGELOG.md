@@ -26,6 +26,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   many wrong codes (HTTP 429), the Pair button is disabled and an amber
   "Too many attempts. Try again in 0:47" line counts down to when you can
   try again.
+- **Hint when Resume is set too close to Throttle.** In Settings, if the
+  resume temperature is less than 6 °C below the throttle temperature, an
+  amber note under the sliders warns that the phone may stay throttled and
+  suggests leaving 8–10 °C between them. It's advice only; you can still
+  save.
 
 ### Changed
 - **Pool URL typos are tidied before checking.** Surrounding spaces are
@@ -74,6 +79,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
   and the wallet no longer appears in release logcat.
 
 ### Fixed
+- **Changing the thread count no longer restarts the miner.** A thermal
+  throttle, the restore after cooling, a new thread count from Settings or
+  OverManager each used to stop and restart mining, so the hashrate dropped
+  to 0 for a few seconds every time. Now only the worker threads change:
+  mining carries on with the current job and the hashrate keeps reading
+  normally.
+- **Throttled threads come back once the phone cools.** After a thermal
+  throttle, full threads were only restored if the temperature stayed at or
+  under the resume temperature for 30 s straight. Normal sensor jitter of
+  about a degree reset that wait, so a phone hovering right at the resume
+  temperature could stay throttled for good. Small wobbles (up to 1 °C over
+  the resume temperature) no longer reset the 30 s wait; a real rise, or
+  reaching the throttle temperature, still does. The same applies to
+  resuming after a heat pause.
+- **The banner shows when you're throttled.** While running fewer threads
+  because of heat, the banner says so (e.g. "Throttled: 4/8 threads — back
+  to 8 below 68°C", then "Cooling — restoring 8 threads in 20s") instead of
+  an unrelated note such as "External power mode".
+- **OverManager sees a throttle that doesn't let go.** The phone reported
+  `throttleState` "moderate" only while it was above the throttle
+  temperature; once it cooled a little it reported "normal" or "light" even
+  though it was still mining on half its threads, so OverManager's throttle
+  alert never saw it. It now reports at least "moderate" until full threads
+  are back ("critical" still wins). Telemetry also carries a new field,
+  `throttledSinceMs`: when heat cut the thread count (epoch ms), or 0 when
+  it isn't throttled, so OverManager can tell a brief throttle from a stuck
+  one. Existing fields are unchanged.
 - **Pairing state updates live.** When OverManager deletes the device, the
   phone's next report drops the credentials, but the card kept saying
   "Paired" and hid the code field until you edited a setting and saved. It

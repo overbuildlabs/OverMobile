@@ -37,9 +37,15 @@ static bool has_job = false;
 /* Run flags are read by worker/reporter threads and written by start/stop;
  * access them with __atomic builtins (volatile alone is not a sync primitive). */
 static bool mining_running = false;
+/* Worker loop condition. Separate from mining_running so mining_set_threads
+ * can stop and respawn the workers while the engine as a whole (isRunning,
+ * the hashrate reporter, windowed hashrate) stays up. Only written under
+ * control_mutex. */
+static bool workers_running = false;
 static pthread_t threads[MAX_THREADS];
+/* Written under control_mutex; read lock-free by the stats getter. */
 static int active_thread_count = 0;
-/* Serialises mining_start / mining_stop. Kotlin calls them from the stratum
+/* Serialises mining_start / mining_stop / mining_set_threads. Kotlin calls them from the stratum
  * IO thread, the stats coroutine, the UI and onDestroy; without this a start
  * racing a stop can overwrite threads[] while it is being joined (hang, or an
  * abort joining an already-joined pthread_t). */
@@ -70,6 +76,7 @@ static ThreadStat thread_stats[MAX_THREADS];
 
 #define SAMPLE_INTERVAL_MS 500
 #define HISTORY_SLOTS 1800   /* 1800 * 500ms = 15 min of history */
+#define REPORTER_SLICE_MS 50
 
 typedef struct {
     uint64_t ts_ms;
@@ -122,7 +129,7 @@ static void *mining_worker(void *arg) {
     uint32_t batch_count = 0;
     const uint32_t JOB_CHECK_INTERVAL = 100; /* Check for new jobs every 100 hashes */
 
-    while (__atomic_load_n(&mining_running, __ATOMIC_ACQUIRE)) {
+    while (__atomic_load_n(&workers_running, __ATOMIC_ACQUIRE)) {
         /* Periodically sync job data */
         if (batch_count % JOB_CHECK_INTERVAL == 0) {
             pthread_mutex_lock(&job_mutex);
@@ -297,11 +304,77 @@ static void *reporter_loop(void *arg) {
         samples_written++;
         pthread_mutex_unlock(&samples_mutex);
 
-        struct timespec sleep_ts = {0, SAMPLE_INTERVAL_MS * 1000000L};
-        nanosleep(&sleep_ts, NULL);
+        /* Sleep in short slices so mining_stop's join doesn't wait out a
+         * whole sample interval. */
+        for (int slept = 0; slept < SAMPLE_INTERVAL_MS &&
+                 __atomic_load_n(&reporter_running, __ATOMIC_ACQUIRE);
+             slept += REPORTER_SLICE_MS) {
+            struct timespec sleep_ts = {0, REPORTER_SLICE_MS * 1000000L};
+            nanosleep(&sleep_ts, NULL);
+        }
     }
     LOGI("Hashrate reporter thread stopped");
     return NULL;
+}
+
+/* ===== Worker lifecycle (caller holds control_mutex) ===== */
+
+/* Launch num_threads workers into threads[0..]. workers_running must be set
+ * and no workers alive. Leaves active_thread_count = number started. */
+static void spawn_workers_locked(int num_threads) {
+    __atomic_store_n(&active_thread_count, 0, __ATOMIC_RELAXED);
+
+    pthread_mutex_lock(&job_mutex);
+    uint64_t prefix = extranonce_prefix;
+    uint64_t mask = extranonce2_mask;
+    pthread_mutex_unlock(&job_mutex);
+
+    int started = 0;
+    for (int i = 0; i < num_threads; i++) {
+        WorkerArgs *args = malloc(sizeof(WorkerArgs));
+        if (!args) {
+            LOGE("Out of memory starting mining thread %d", i);
+            break;
+        }
+        args->thread_id = i;
+        args->stride = num_threads;
+
+        /* Random start in the extranonce2 space, offset by thread index.
+         * Mask after adding the index so the start can't carry into the
+         * extranonce prefix bits (the bridge couldn't reconstruct it). */
+        uint64_t random_part = ((uint64_t)rand() << 32) | (uint64_t)rand();
+        args->nonce_start = prefix | ((random_part + (uint64_t)i) & mask);
+
+        LOGI("Thread %d nonce_start: 0x%016llx (prefix=0x%016llx, mask=0x%016llx)",
+             i, (unsigned long long)args->nonce_start,
+             (unsigned long long)prefix, (unsigned long long)mask);
+
+        if (pthread_create(&threads[started], NULL, mining_worker, args) != 0) {
+            /* Leave threads[] holding only real handles: join_workers_locked
+             * joins exactly active_thread_count of them. */
+            LOGE("pthread_create failed for mining thread %d", i);
+            free(args);
+            break;
+        }
+        started++;
+    }
+    __atomic_store_n(&active_thread_count, started, __ATOMIC_RELAXED);
+}
+
+static void join_workers_locked(void) {
+    __atomic_store_n(&workers_running, false, __ATOMIC_RELEASE);
+    int n = __atomic_load_n(&active_thread_count, __ATOMIC_RELAXED);
+    for (int i = 0; i < n; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    __atomic_store_n(&active_thread_count, 0, __ATOMIC_RELAXED);
+}
+
+static void stop_reporter_locked(void) {
+    if (__atomic_load_n(&reporter_running, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&reporter_running, false, __ATOMIC_RELEASE);
+        pthread_join(reporter_thread, NULL);
+    }
 }
 
 /* ===== Public API ===== */
@@ -320,10 +393,10 @@ void mining_start(int num_threads) {
      * restarts the engine, and resetting them there zeroed the accepted
      * count mid-session. MiningService calls mining_reset_stats() when the
      * user starts a new session. */
-    active_thread_count = 0;
     total_hashes = 0;
     hash_count_for_rate = 0;
     __atomic_store_n(&mining_running, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&workers_running, true, __ATOMIC_RELEASE);
 
     /* Reset per-thread counters and hashrate history */
     for (int i = 0; i < MAX_THREADS; i++) {
@@ -351,48 +424,56 @@ void mining_start(int num_threads) {
     /* Seed nonce from random source */
     srand((unsigned int)time(NULL));
 
-    pthread_mutex_lock(&job_mutex);
-    uint64_t prefix = extranonce_prefix;
-    uint64_t mask = extranonce2_mask;
-    pthread_mutex_unlock(&job_mutex);
-
-    for (int i = 0; i < num_threads; i++) {
-        WorkerArgs *args = malloc(sizeof(WorkerArgs));
-        if (!args) {
-            LOGE("Out of memory starting mining thread %d", i);
-            break;
-        }
-        args->thread_id = i;
-        args->stride = num_threads;
-
-        /* Random start in the extranonce2 space, offset by thread index.
-         * Mask after adding the index so the start can't carry into the
-         * extranonce prefix bits (the bridge couldn't reconstruct it). */
-        uint64_t random_part = ((uint64_t)rand() << 32) | (uint64_t)rand();
-        args->nonce_start = prefix | ((random_part + (uint64_t)i) & mask);
-
-        LOGI("Thread %d nonce_start: 0x%016llx (prefix=0x%016llx, mask=0x%016llx)",
-             i, (unsigned long long)args->nonce_start,
-             (unsigned long long)prefix, (unsigned long long)mask);
-
-        if (pthread_create(&threads[active_thread_count], NULL, mining_worker, args) != 0) {
-            /* Leave threads[] holding only real handles: mining_stop joins
-             * exactly active_thread_count of them. */
-            LOGE("pthread_create failed for mining thread %d", i);
-            free(args);
-            break;
-        }
-        active_thread_count++;
-    }
-    if (active_thread_count == 0) {
+    spawn_workers_locked(num_threads);
+    if (__atomic_load_n(&active_thread_count, __ATOMIC_RELAXED) == 0) {
         LOGE("No mining threads could be started");
+        __atomic_store_n(&workers_running, false, __ATOMIC_RELEASE);
         __atomic_store_n(&mining_running, false, __ATOMIC_RELEASE);
-        if (__atomic_load_n(&reporter_running, __ATOMIC_ACQUIRE)) {
-            __atomic_store_n(&reporter_running, false, __ATOMIC_RELEASE);
-            pthread_join(reporter_thread, NULL);
-        }
+        stop_reporter_locked();
     }
     pthread_mutex_unlock(&control_mutex);
+}
+
+int mining_set_threads(int num_threads) {
+    pthread_mutex_lock(&control_mutex);
+    if (!__atomic_load_n(&mining_running, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_unlock(&control_mutex);
+        return -1;
+    }
+
+    if (num_threads < 1) num_threads = 1;
+    if (num_threads > MAX_THREADS) num_threads = MAX_THREADS;
+
+    int old = __atomic_load_n(&active_thread_count, __ATOMIC_RELAXED);
+    if (num_threads == old) {
+        pthread_mutex_unlock(&control_mutex);
+        return old;
+    }
+    LOGI("Changing mining threads %d -> %d", old, num_threads);
+
+    /* Only the workers restart. mining_running, the reporter thread, the
+     * sample history, the job/extranonce state and the hash counters all
+     * carry over, so the windowed hashrate never sees a gap or a reset.
+     * thread_stats is deliberately not zeroed: a slot reused by a new
+     * worker continues from its old count and slots beyond the new count
+     * keep their final value, so sum_thread_hashes() stays monotonic. */
+    join_workers_locked();
+    __atomic_store_n(&workers_running, true, __ATOMIC_RELEASE);
+    spawn_workers_locked(num_threads);
+
+    int started = __atomic_load_n(&active_thread_count, __ATOMIC_RELAXED);
+    if (started == 0) {
+        /* No worker came back: stop for real rather than report a running
+         * engine that hashes nothing. */
+        LOGE("No mining threads could be restarted; stopping");
+        __atomic_store_n(&workers_running, false, __ATOMIC_RELEASE);
+        __atomic_store_n(&mining_running, false, __ATOMIC_RELEASE);
+        stop_reporter_locked();
+        pthread_mutex_unlock(&control_mutex);
+        return -1;
+    }
+    pthread_mutex_unlock(&control_mutex);
+    return started;
 }
 
 void mining_stop(void) {
@@ -404,18 +485,11 @@ void mining_stop(void) {
 
     LOGI("Stopping mining...");
     __atomic_store_n(&mining_running, false, __ATOMIC_RELEASE);
-
-    for (int i = 0; i < active_thread_count; i++) {
-        pthread_join(threads[i], NULL);
-    }
+    join_workers_locked();
 
     /* Stop reporter thread after workers so final sample captures their last hashes */
-    if (__atomic_load_n(&reporter_running, __ATOMIC_ACQUIRE)) {
-        __atomic_store_n(&reporter_running, false, __ATOMIC_RELEASE);
-        pthread_join(reporter_thread, NULL);
-    }
+    stop_reporter_locked();
 
-    active_thread_count = 0;
     LOGI("Mining stopped. Total hashes: %llu", (unsigned long long)total_hashes);
     pthread_mutex_unlock(&control_mutex);
 }
@@ -516,7 +590,7 @@ uint64_t mining_get_thread_hashes(int thread_idx) {
 }
 
 int mining_get_active_threads(void) {
-    return active_thread_count;
+    return __atomic_load_n(&active_thread_count, __ATOMIC_RELAXED);
 }
 
 uint64_t mining_get_total_hashes(void) {

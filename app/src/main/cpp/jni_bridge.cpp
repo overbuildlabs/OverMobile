@@ -89,6 +89,13 @@ Java_com_proofofprints_popmobile_mining_MiningEngine_nativeStop(
     mining_stop();
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_proofofprints_popmobile_mining_MiningEngine_nativeSetThreads(
+        JNIEnv *env, jobject thiz, jint numThreads) {
+    LOGI("nativeSetThreads called with %d threads", numThreads);
+    return (jint)mining_set_threads((int)numThreads);
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_proofofprints_popmobile_mining_MiningEngine_nativeIsRunning(
         JNIEnv *env, jobject thiz) {
