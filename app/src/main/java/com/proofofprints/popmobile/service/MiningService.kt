@@ -168,6 +168,14 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
      *  [RESUME_HOLD_MS] (see [ResumeHold]). Written by the stats loop, read
      *  by the poller for the banner countdown. */
     @Volatile private var coolingSince: Long = 0L
+    /** Wall-clock ms when heat cut the thread count below the ceiling (0 =
+     *  not throttled). Unlike [thermalState] it stays set after the phone
+     *  cools below the throttle temperature, until threads are restored, so
+     *  telemetry can report a stuck throttle (see [reportedThrottleState]).
+     *  Written by the stats loop and session start/stop, read by the
+     *  reporter's IO thread. */
+    @Volatile var throttledSince: Long = 0L
+        private set
     /** How long the temperature must stay at or near resumeTempC before we
      *  bring mining back up from a thermal pause or restore throttled
      *  threads. */
@@ -347,11 +355,12 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                 difficulty = currentDifficulty,
                 runtimeSeconds = runtime,
                 cpuTemp = cpuTemp,
-                throttleState = mapThrottleState(thermalState),
+                throttleState = reportedThrottleState(),
                 batteryLevel = batteryPercent,
                 batteryCharging = isCharging,
                 threads = if (miningEngine.isRunning) activeThreads else threadCount,
-                status = status
+                status = status,
+                throttledSinceMs = throttledSince
             )
         }
     }
@@ -515,6 +524,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                 engineStartedOnce = false
                 hasJob = false
                 activeThreads = 0
+                throttledSince = 0L
                 poolState = PoolState.CONNECTING
                 stratumClient.connect(poolHost, poolPort, walletAddress, workerName)
                 // Mining engine will be restarted by the stratum job handler
@@ -522,6 +532,16 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                 Log.e(TAG, "restartMiningInternal failed: ${e.message}")
             }
         }
+    }
+
+    /** Telemetry throttle state: the current reading, but at least
+     *  "moderate" while heat is still holding threads down, so OverManager
+     *  sees a throttle that outlasts the throttle temperature. Reads the
+     *  volatile once so the two checks can't disagree. */
+    private fun reportedThrottleState(): String {
+        val reading = mapThrottleState(thermalState)
+        val since = throttledSince
+        return if (since != 0L && (reading == "normal" || reading == "light")) "moderate" else reading
     }
 
     private fun mapThrottleState(state: ThermalMonitor.ThermalState): String = when (state) {
@@ -670,6 +690,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
         pauseReason = null
         coolingSince = 0L
         activeThreads = 0
+        throttledSince = 0L
         engineStartedOnce = false
         hasJob = false
         statsJob?.cancel()
@@ -802,6 +823,9 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                         if (changeThreads(target)) onStatsUpdate?.invoke()
                         if (!isSessionActive) return
                     }
+                    // A lowered ceiling at or below the throttled count
+                    // means heat no longer holds threads down.
+                    if (activeThreads >= ceiling) throttledSince = 0L
                 }
                 sessionThreadCeiling = ceiling
             }
@@ -842,6 +866,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                         miningEngine.start(threadCount)
                         activeThreads = threadCount
                         engineStartedOnce = true
+                        throttledSince = 0L
                     }
                     updateProtectionBanner(lastDeviceStatus)
                     onStatsUpdate?.invoke()
@@ -852,7 +877,9 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                     val recommended = maxOf(1, threadCount / 2)
                     if (miningEngine.isRunning && recommended < activeThreads) {
                         Log.w(TAG, "THERMAL THROTTLE (${cpuTemp}°C) — reducing to $recommended threads")
-                        changeThreads(recommended)
+                        if (changeThreads(recommended) && throttledSince == 0L) {
+                            throttledSince = System.currentTimeMillis()
+                        }
                         if (!isSessionActive) return
                         onThermalWarning?.invoke(thermalState, cpuTemp)
                     }
@@ -866,7 +893,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                         val step = stepCoolingHold(heat, "before restoring $threadCount threads (now $activeThreads)")
                         if (step == ResumeHold.Step.READY) {
                             Log.i(TAG, "Restoring thread count $activeThreads → $threadCount (${cpuTemp}°C)")
-                            changeThreads(threadCount)
+                            if (changeThreads(threadCount)) throttledSince = 0L
                             if (!isSessionActive) return
                             coolingSince = 0L
                             updateProtectionBanner(lastDeviceStatus)
@@ -875,6 +902,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
                     } else {
                         // Not throttled (e.g. a lowered ceiling): nothing to hold.
                         coolingSince = 0L
+                        if (miningEngine.isRunning) throttledSince = 0L
                     }
                 }
                 // CRITICAL heat is always a blocker, handled above.
@@ -1049,6 +1077,7 @@ class MiningService : Service(), StratumClient.StratumListener, MiningEngine.Sha
             miningEngine.start(threadCount)
             activeThreads = threadCount
             engineStartedOnce = true
+            throttledSince = 0L
             LogManager.info("Mining started ($threadCount threads)")
             updateNotification("Mining...")
         }

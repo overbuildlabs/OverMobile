@@ -1765,6 +1765,17 @@ class MainActivity : ComponentActivity() {
                             fontFamily = FontFamily.Monospace
                         )
                     }
+                    // Restoring threads needs the phone to cool to Resume
+                    // and hold there; too close to Throttle and it rarely
+                    // does, so it sits at half threads. Advice only.
+                    if (resumeTemp > throttleTemp - 6f) {
+                        Text(
+                            "Resume is close to throttle, so the phone may stay throttled. Leave 8–10 °C between them.",
+                            color = Color(0xFFFBBF24),
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(4.dp))

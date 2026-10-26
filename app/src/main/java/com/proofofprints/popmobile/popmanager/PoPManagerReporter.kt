@@ -98,7 +98,9 @@ class PoPManagerReporter(
         val batteryCharging: Boolean,
         val threads: Int,
         val status: String,         // mining | paused | stopped | error
-        val errorMessage: String? = null
+        val errorMessage: String? = null,
+        /** Epoch ms when heat cut the thread count, 0 when not throttled. */
+        val throttledSinceMs: Long = 0L
     )
 
     data class Command(
@@ -628,6 +630,7 @@ class PoPManagerReporter(
             addProperty("runtime", snap.runtimeSeconds)
             addProperty("cpuTemp", snap.cpuTemp)
             addProperty("throttleState", snap.throttleState)
+            addProperty("throttledSinceMs", snap.throttledSinceMs)
             addProperty("batteryLevel", snap.batteryLevel)
             addProperty("batteryCharging", snap.batteryCharging)
             addProperty("threads", snap.threads)
