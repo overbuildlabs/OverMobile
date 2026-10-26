@@ -117,6 +117,19 @@ battery reads 100 % before the service binds. One shared formatter.
 OverManager sees `stopped` while the phone is connecting or waiting for its
 first job. Add a `connecting` status once OverManager accepts it.
 
+### R19 · P2 · Sustained-throttle alert in OverManager — cross-repo
+The phone now reports `throttleState` "moderate" for as long as heat holds
+its threads down, plus `throttledSinceMs` (epoch ms the throttle began, 0
+when not throttled). OverManager's `RuleType::MobileThrottle` rule
+(`L:\OverManagerPrivate`, `src-tauri/src/commands/alerts.rs`, ~line 815)
+fires on any moderate/severe/critical report and ignores its threshold, so
+with the new reporting a brief throttle would alert just like a stuck one.
+Use the rule's threshold as minutes: fire only when
+`now − throttledSinceMs ≥ threshold` (fall back to today's behaviour when the
+field is missing or 0, for older phones). Label the threshold "minutes" in
+the rule editor. Done when a 1-minute throttle doesn't alert with a
+10-minute rule and a phone stuck at half threads does.
+
 ---
 
 ## Performance
@@ -136,6 +149,15 @@ vector, is the biggest single hashrate win available.
 A short benchmark mode that tries 1..N threads and picks the best
 hashes-per-°C (or hashes/s under the user's throttle threshold). Show the
 result; let the user accept it.
+
+### P4 · Stepped thread restore
+After a throttle, `MiningService.statsUpdateLoop` restores straight from
+half to the full count (e.g. 4 → 8) after one cool-down hold. A phone that
+can sustain 6 threads but not 8 then bounces between 4 and 8. Restore in
+steps instead (e.g. 4 → 6 → 8, a cool-down hold before each step), and on a
+re-throttle drop only one step. Keep `throttledSince` set until the full
+count is back. Done when logcat shows a hot-running phone settling at an
+intermediate count instead of cycling.
 
 ---
 
