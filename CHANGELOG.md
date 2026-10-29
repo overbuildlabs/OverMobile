@@ -4,6 +4,8 @@ All notable changes to OverMobile are recorded here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [1.3.0] — 2026-10-26
 ### Added
 - **Save / Cancel bar at the top of Settings.** The Save button used to sit
   at the very bottom of a long list. A bar now stays pinned above the
@@ -298,6 +300,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Mining log retaining the last four hours of stratum + share events.
 - OverManager pairing with per-device API keys, telemetry every 30 s, and remote commands (`set_config`, `set_threads`, `start`, `stop`, `restart`) applied and acknowledged.
 
+[1.3.0]: https://github.com/overbuildlabs/OverMobile/releases/tag/v1.3.0
+[1.2.0]: https://github.com/overbuildlabs/OverMobile/releases/tag/v1.2.0
 [1.0.14]: https://github.com/proofofprints/PoPMobile/releases/tag/v1.0.14
 [1.0.13]: https://github.com/proofofprints/PoPMobile/releases/tag/v1.0.13
 [1.0.12]: https://github.com/proofofprints/PoPMobile/releases/tag/v1.0.12
